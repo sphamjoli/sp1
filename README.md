@@ -2,6 +2,10 @@
 
 ![SP1](./assets/sp1.png)
 
+> **Fork for the Echo project.** Makes `sp1-verifier` build into a `no_std` runtime by gating the
+> std-only recursion path behind an off-by-default `recursion` feature; verification unchanged. See
+> [`crates/verifier/README.md`](./crates/verifier/README.md).
+
 SP1 is the fastest, most-feature complete zero-knowledge virtual machine (zkVM) that can prove the execution of arbitrary Rust (or any LLVM-compiled language) programs. SP1 makes ZK accessible to *any developer*, by making it easy to write ZKP programs in normal Rust code.
 
 **[Install](https://docs.succinct.xyz/docs/sp1/getting-started/install)**

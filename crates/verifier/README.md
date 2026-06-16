@@ -8,10 +8,22 @@ It is split into the following modules:
 - `plonk`: Verifiers for Plonk proofs.
 
 
+## no_std fork: on-chain verification
+
+Upstream `sp1-verifier` claims `no_std`, but its compressed/recursion path drags in std-only crates
+(`zkhash`→`bls12_381`→`getrandom`, `ahash`→`once_cell`) unconditionally — so it won't compile into a
+runtime, even for Groth16 alone.
+
+This fork gates that path (`compressed`, `proof`, `recursion_vks`) behind an off-by-default
+`recursion` feature, leaving a lean no_std Groth16/Plonk verifier. The one recursion-derived value
+Groth16 needs — the 32-byte verifying-key root — is an embedded constant, re-derived and asserted by a
+`--features recursion` test. Cryptography unchanged: same v6.1.0 release, keys, trusted setup and
+checks; proofs verify identically upstream.
+
 ## Features
 
-Groth16, Plonk and Compressed proof verification are supported in `no-std` environments. Verification in the
-SP1 zkVM context is patched, in order to make use of the
+Default build: Groth16 + Plonk in `no_std`. Compressed (recursion) verification is behind the
+`recursion` feature and needs `std`. zkVM-context verification is patched to use the
 [bn254 precompiles](https://blog.succinct.xyz/succinctshipsprecompiles/).
 
 ### Pre-generated verification keys

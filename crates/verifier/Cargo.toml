@@ -17,23 +17,23 @@ bn = { version = "=0.6.0", package = "substrate-bn-succinct-rs" }
 sha2 = { version = "0.10.8", default-features = false }
 thiserror = { version = "2", default-features = false }
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
-lazy_static = { version = "1.5.0", default-features = false }
+lazy_static = { version = "1.5.0", default-features = false, features = ["spin_no_std"] }
 blake3 = { workspace = true }
 cfg-if = "1.0.0"
 
-bincode = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-strum = { workspace = true, features = ["derive"] }
 
-# sp1
-sp1-hypercube = { workspace = true }
-sp1-primitives = { workspace = true }
-sp1-recursion-machine = { workspace = true, default-features = false }
-sp1-recursion-executor = { workspace = true, default-features = false }
-slop-algebra = { workspace = true }
-slop-challenger = { workspace = true }
-slop-primitives = { workspace = true }
-slop-symmetric = { workspace = true }
+# std-only, gated behind `recursion` so the Groth16/Plonk path stays no_std.
+bincode = { workspace = true, optional = true }
+strum = { workspace = true, features = ["derive"], optional = true }
+sp1-hypercube = { workspace = true, optional = true }
+sp1-primitives = { workspace = true, optional = true }
+sp1-recursion-machine = { workspace = true, default-features = false, optional = true }
+sp1-recursion-executor = { workspace = true, default-features = false, optional = true }
+slop-algebra = { workspace = true, optional = true }
+slop-challenger = { workspace = true, optional = true }
+slop-primitives = { workspace = true, optional = true }
+slop-symmetric = { workspace = true, optional = true }
 
 # arkworks
 ark-bn254 = { version = "0.5.0", optional = true }
@@ -57,6 +57,18 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 default = []
 std = ["thiserror/std"]
 ark = ["ark-bn254", "ark-serialize", "ark-ff", "ark-groth16", "ark-ec"]
+recursion = [
+	"dep:bincode",
+	"dep:strum",
+	"dep:sp1-hypercube",
+	"dep:sp1-primitives",
+	"dep:sp1-recursion-machine",
+	"dep:sp1-recursion-executor",
+	"dep:slop-algebra",
+	"dep:slop-challenger",
+	"dep:slop-primitives",
+	"dep:slop-symmetric",
+]
 
 [lints]
 workspace = true
