@@ -1,6 +1,6 @@
-use std::cell::{Ref, RefCell, RefMut};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::compiler::TranscriptReadError;
 use crate::zk::dot_product::{dot_product, verify_zk_dot_product, ZkDotProductError};
 use crate::zk::error_correcting_code::RsFromCoefficients;
 use crate::zk::hadamard_product::{verify_zk_hadamard_and_dots, ZkHadamardAndDotsError};
@@ -22,8 +22,8 @@ use super::{
 /// Handle to a [`ZkVerificationContextInner`] that provides shared mutable access.
 /// This is the main type users interact with for verifying zero-knowledge proofs.
 ///
-/// The handle wraps the inner context in `Rc<RefCell<>>` to allow elements
-/// to hold references back to the context.
+/// The handle wraps the inner context in `Arc<Mutex<>>` to allow elements
+/// to hold references back to the context, while remaining `Send + Sync`.
 ///
 /// # Type Parameters
 /// * `GC` - The ZK IOP context type; `GC::PcsProof` is the PCS proof type.
@@ -31,7 +31,7 @@ use super::{
 /// Contains a challenger which can be accessed using self.borrow_mut().challenger
 #[derive(Clone)]
 pub struct ZkVerificationContext<GC: ZkIopCtx> {
-    inner: Rc<RefCell<ZkVerificationContextInner<GC>>>,
+    inner: Arc<Mutex<ZkVerificationContextInner<GC>>>,
 }
 
 /// Verification context that accumulates constraints during verification.
@@ -107,7 +107,7 @@ impl<GC: ZkIopCtx> ConstraintContextInner<GC::EF> for ZkVerificationContext<GC> 
         a: VerifierLinExpression<GC::EF>,
         b: VerifierLinExpression<GC::EF>,
     ) -> Option<VerifierElement<GC::EF>> {
-        let index: VerifierElement<GC::EF> = self.read_one_raw()?.into();
+        let index: VerifierElement<GC::EF> = self.read_one_raw().ok()?.into();
         self.constrain_mul_triple(a, b, index);
         Some(index)
     }
@@ -165,44 +165,49 @@ impl<GC: ZkIopCtx> ZkProof<GC> {
             proof: self.proof,
         };
 
-        ZkVerificationContext { inner: Rc::new(RefCell::new(inner)) }
+        ZkVerificationContext { inner: Arc::new(Mutex::new(inner)) }
     }
 }
 
 impl<GC: ZkIopCtx> ZkVerificationContext<GC> {
-    /// Borrow the inner context mutably and return a guard.
-    pub fn borrow_mut(&self) -> RefMut<'_, ZkVerificationContextInner<GC>> {
-        self.inner.borrow_mut()
+    /// Lock the inner context mutably and return a guard.
+    pub fn borrow_mut(&self) -> MutexGuard<'_, ZkVerificationContextInner<GC>> {
+        self.inner.lock().expect("ZkVerificationContext mutex poisoned")
     }
 
-    /// Borrow the inner context immutably and return a guard.
-    pub fn borrow(&self) -> Ref<'_, ZkVerificationContextInner<GC>> {
-        self.inner.borrow()
+    /// Lock the inner context and return a guard.
+    pub fn borrow(&self) -> MutexGuard<'_, ZkVerificationContextInner<GC>> {
+        self.inner.lock().expect("ZkVerificationContext mutex poisoned")
     }
 
     // Read the next message of expected length, observe it, and return its block index and length.
-    // The expected length must match the length of the message in the proof, otherwise returns `None`.
-    fn read_raw(&mut self, expected_length: usize) -> Option<(usize, usize)> {
+    // Returns `TranscriptExhausted` if there is no next message, or `TranscriptReadMismatch` if
+    // the next message's length doesn't match `expected_length`.
+    fn read_raw(&mut self, expected_length: usize) -> Result<(usize, usize), TranscriptReadError> {
         let mut inner = self.borrow_mut();
         let ZkVerificationContextInner { transcript, challenger, values_current_index, .. } =
             &mut *inner;
         let block_index = *values_current_index;
-        let vals = transcript.get_values(block_index)?;
+        let vals =
+            transcript.get_values(block_index).ok_or(TranscriptReadError::TranscriptExhausted)?;
         if vals.len() != expected_length {
-            return None;
+            return Err(TranscriptReadError::TranscriptReadMismatch {
+                expected: expected_length,
+                got: vals.len(),
+            });
         }
 
         challenger.observe_ext_element_slice(vals);
         *values_current_index += 1;
 
-        Some((block_index, expected_length))
+        Ok((block_index, expected_length))
     }
 
-    // Read the next message of length 1, observe it, and returns its index in the transcript.
-    // The expected length must be 1, otherwise returns `None`.
-    fn read_one_raw(&mut self) -> Option<[usize; 2]> {
+    // Read the next message of length 1, observe it, and return its index in the transcript.
+    // The expected length must be 1, otherwise returns `TranscriptReadMismatch`.
+    fn read_one_raw(&mut self) -> Result<[usize; 2], TranscriptReadError> {
         let (block_index, _) = self.read_raw(1)?;
-        Some([block_index, 0])
+        Ok([block_index, 0])
     }
 
     /// Returns the index of the next block to be read.
@@ -261,14 +266,14 @@ impl<GC: ZkIopCtx> ZkVerificationContext<GC> {
 
         // Extract the inner context, cloning if there are still outstanding references
         // (e.g., from VerifierElements that haven't been dropped yet)
-        let mut inner = match Rc::try_unwrap(self.inner) {
-            Ok(refcell) => refcell.into_inner(),
-            Err(rc) => {
+        let mut inner = match Arc::try_unwrap(self.inner) {
+            Ok(mutex) => mutex.into_inner().expect("ZkVerificationContext mutex poisoned"),
+            Err(arc) => {
                 eprintln!(
                     "WARNING: ZkVerificationContext has outstanding references (likely from VerifierElements). \
                      Cloning inner context. Consider dropping VerifierElements before calling verify."
                 );
-                rc.borrow().clone()
+                arc.lock().expect("ZkVerificationContext mutex poisoned").clone()
             }
         };
 
@@ -335,24 +340,35 @@ impl<GC: ZkIopCtx> ZkVerificationContext<GC> {
         mul_proof: Option<ZkMulCnstrProof<GC>>,
     ) -> Result<(), ZkVerifierError> {
         let Some(mul_proof) = mul_proof else {
-            return Ok(());
+            if self.borrow().mul_constraints.is_empty() {
+                return Ok(());
+            } else {
+                return Err(ZkVerifierError::InvalidMulConstrProofShape);
+            }
         };
 
-        // Read/observe padding and add in padding constraints
-        for _ in 0..2 {
-            let [a, b] = self
-                .read_next(2)
-                .ok_or(ZkVerifierError::InvalidMulConstrProofShape)?
-                .try_into()
-                .unwrap();
-            let c = self.read_one().ok_or(ZkVerifierError::InvalidMulConstrProofShape)?;
-            // Add in the multiplicative constraint the padding should satisfy
-            self.constrain_mul_triple(
-                a.try_into_index().unwrap(),
-                b.try_into_index().unwrap(),
-                c.try_into_index().unwrap(),
-            );
-        }
+        // Read/observe the 6 padding values and enforce the two tautological mul
+        // constraints. The honest prover populates this block with
+        // `(r, s, rs, r-1, t, (r-1)t)` for i.i.d. uniform `r, s, t`; we only enforce
+        // `r * s = rs` and `(r-1) * t = (r-1)t`, which is all that soundness
+        // requires. The structural relation between the two `a` entries (the second
+        // equals the first minus one) is needed only for the simulator's bijection
+        // in the zero-knowledge argument.
+        let [a1, b1, c1, a2, b2, c2]: [_; 6] = self
+            .read_next(6)
+            .map_err(|_| ZkVerifierError::InvalidMulConstrProofShape)?
+            .try_into()
+            .map_err(|_| ZkVerifierError::InvalidMulConstrProofShape)?;
+        self.constrain_mul_triple(
+            a1.try_into_index().ok_or(ZkVerifierError::InvalidMulConstrProofShape)?,
+            b1.try_into_index().ok_or(ZkVerifierError::InvalidMulConstrProofShape)?,
+            c1.try_into_index().ok_or(ZkVerifierError::InvalidMulConstrProofShape)?,
+        );
+        self.constrain_mul_triple(
+            a2.try_into_index().ok_or(ZkVerifierError::InvalidMulConstrProofShape)?,
+            b2.try_into_index().ok_or(ZkVerifierError::InvalidMulConstrProofShape)?,
+            c2.try_into_index().ok_or(ZkVerifierError::InvalidMulConstrProofShape)?,
+        );
 
         let mul_len = self.borrow().mul_constraints.len();
 
@@ -401,6 +417,10 @@ pub struct NoPcsVerifier;
 impl<GC: ZkIopCtx> ZkPcsVerifier<GC> for NoPcsVerifier {
     type Proof = GC::PcsProof;
 
+    fn num_encoding_variables(&self) -> u32 {
+        panic!("NoPcsVerifier::num_encoding_variables should never be called")
+    }
+
     fn verify_multi_eval(
         &self,
         _ctx: &mut ZkVerificationContext<GC>,
@@ -430,25 +450,27 @@ impl<GC: ZkIopCtx> ZkVerificationContext<GC> {
 impl<GC: ZkIopCtx> ZkCnstrAndReadingCtxInner<GC> for ZkVerificationContext<GC> {
     /// Receives the next message of length 1, observes it, and outputs a single [`ExpressionIndex`].
     ///
-    /// The expected length must be 1, otherwise returns `None`.
-    fn read_one(&mut self) -> Option<<Self as ConstraintContextInnerExt<GC::EF>>::Expr> {
+    /// Errors if the transcript is exhausted or the message length isn't 1.
+    fn read_one(
+        &mut self,
+    ) -> Result<<Self as ConstraintContextInnerExt<GC::EF>>::Expr, TranscriptReadError> {
         let idx = self.read_one_raw()?;
-        Some(self.add_expr(idx.into()))
+        Ok(self.add_expr(idx.into()))
     }
 
     /// Receives the next message, observes it, and outputs [`ExpressionIndex`]es.
     ///
-    /// The expected length must match the length of the message in the proof, otherwise returns `None`.
+    /// Errors if the transcript is exhausted or the message length doesn't match `num`.
     fn read_next(
         &mut self,
         num: usize,
-    ) -> Option<Vec<<Self as ConstraintContextInnerExt<GC::EF>>::Expr>> {
+    ) -> Result<Vec<<Self as ConstraintContextInnerExt<GC::EF>>::Expr>, TranscriptReadError> {
         let (block_index, len) = self.read_raw(num)?;
-        Some((0..len).map(|i| self.add_expr([block_index, i].into())).collect())
+        Ok((0..len).map(|i| self.add_expr([block_index, i].into())).collect())
     }
 
-    fn challenger(&mut self) -> RefMut<'_, GC::Challenger> {
-        RefMut::map(self.borrow_mut(), |inner| &mut inner.challenger)
+    fn with_challenger<R>(&mut self, f: impl FnOnce(&mut GC::Challenger) -> R) -> R {
+        f(&mut self.borrow_mut().challenger)
     }
 
     fn read_next_pcs_commitment(
@@ -475,41 +497,4 @@ impl<GC: ZkIopCtx> ZkCnstrAndReadingCtxInner<GC> for ZkVerificationContext<GC> {
 
         Some(MleCommitmentIndex::new(idx))
     }
-}
-
-#[derive(Debug, Eq, PartialEq, Error)]
-#[error("invalid proof shape")]
-pub struct ZKProtocolShapeError;
-
-/// Trait for protocol parameters that know how to read proof values from transcript.
-///
-/// This trait is implemented on parameter structs (e.g., `ZkPartialSumcheckParameters`)
-/// and produces self-contained proof structs that include the parameters.
-///
-/// The returned proof contains `VerifierElement<GC>` since `read_proof_from_transcript`
-/// reads from the verifier context.
-pub trait ZkProtocolParameters<GC: ZkIopCtx, C: ZkCnstrAndReadingCtxInner<GC>> {
-    /// The proof type produced by reading from transcript.
-    /// Must implement `ZkProtocolProof` so it can generate its own constraints.
-    type Proof: ZkProtocolProof<GC, C>;
-
-    /// Reads proof values from transcript, reconstructs Fiat-Shamir state,
-    /// and returns a self-contained proof that includes these parameters.
-    fn read_proof_from_transcript(&self, context: &mut C) -> Option<Self::Proof>;
-}
-
-/// Trait for self-contained proofs that can generate their own constraints.
-///
-/// Proofs implementing this trait contain all necessary data (including parameters)
-/// to generate linear constraints without additional inputs.
-///
-/// Generic over ConstraintContextOuter to be uniform across prover and verifier.
-pub trait ZkProtocolProof<GC: ZkIopCtx, C: ConstraintContextInnerExt<GC::EF>>:
-    std::fmt::Debug + Clone
-{
-    /// Builds and asserts constraints for this proof using the element's expression type.
-    ///
-    /// This method consumes `self` to ensure all stored elements are dropped after
-    /// building constraints, which releases references to the context.
-    fn build_constraints(self);
 }

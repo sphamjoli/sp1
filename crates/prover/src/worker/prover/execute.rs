@@ -1,20 +1,23 @@
 use futures::{stream::FuturesUnordered, StreamExt};
 use slop_futures::pipeline::{AsyncEngine, AsyncWorker, Pipeline, SubmitHandle};
 use sp1_core_executor::{
-    ExecutionError, ExecutionReport, GasEstimatingVM, Program, SP1Context, SP1CoreOpts,
+    ExecutionError, ExecutionReport, GasEstimatingVMEnum, Program, SP1Context, SP1CoreOpts,
     SP1RecursionProof,
 };
 use sp1_core_executor_runner::MinimalExecutorRunner;
 use sp1_core_machine::io::SP1Stdin;
-use sp1_hypercube::air::PROOF_NONCE_NUM_WORDS;
-use sp1_hypercube::{MachineVerifyingKey, SP1PcsProofInner, SP1VerifyingKey};
+use sp1_core_machine::riscv::RiscvAir;
+use sp1_hypercube::air::{PROOF_NONCE_NUM_WORDS, PV_DIGEST_NUM_WORDS};
+use sp1_hypercube::{Machine, MachineVerifyingKey, SP1PcsProofInner, SP1VerifyingKey};
 use sp1_jit::TraceChunkRaw;
 use sp1_primitives::io::SP1PublicValues;
-use sp1_primitives::SP1GlobalContext;
+use sp1_primitives::{SP1Field, SP1GlobalContext};
 use std::sync::Arc;
 use tracing::Instrument;
 
 use crate::verify::SP1Verifier;
+#[cfg(feature = "mprotect")]
+use crate::{recursion::RecursionVks, worker::DEFAULT_MAX_COMPOSE_ARITY};
 
 type DeferredProofInput =
     (SP1RecursionProof<SP1GlobalContext, SP1PcsProofInner>, MachineVerifyingKey<SP1GlobalContext>);
@@ -95,12 +98,12 @@ impl AsyncWorker<GasExecutingTask, Result<ExecutionReport, ExecutionError>> for 
             return Ok(ExecutionReport::default());
         }
         let mut gas_estimating_vm =
-            GasEstimatingVM::new(&chunk, self.program.clone(), self.nonce, self.opts.clone());
+            GasEstimatingVMEnum::new(&chunk, self.program.clone(), self.nonce, self.opts.clone());
         let report = gas_estimating_vm.execute()?;
 
         // If the VM has completed execution, set the final state.
-        if gas_estimating_vm.core.is_done() {
-            let final_state = FinalVmState::new(&gas_estimating_vm.core);
+        if gas_estimating_vm.is_done() {
+            let final_state = FinalVmState::from_gas_estimating_vm_enum(&gas_estimating_vm);
             final_vm_state.set(final_state).map_err(|e| {
                 ExecutionError::Other(format!("failed to set final vm state: {}", e))
             })?;
@@ -110,11 +113,18 @@ impl AsyncWorker<GasExecutingTask, Result<ExecutionReport, ExecutionError>> for 
     }
 }
 
-fn verify_deferred_proofs(proofs: &[DeferredProofInput]) -> anyhow::Result<()> {
+fn verify_deferred_proofs(
+    machine: Machine<SP1Field, RiscvAir<SP1Field>>,
+    proofs: &[DeferredProofInput],
+) -> anyhow::Result<()> {
     if proofs.is_empty() {
         return Ok(());
     }
-    let verifier = SP1Verifier::new(crate::verify::VerifierRecursionVks::default());
+    #[cfg(feature = "mprotect")]
+    let verifier_vks = RecursionVks::new(None, DEFAULT_MAX_COMPOSE_ARITY, false).to_verifier_vks();
+    #[cfg(not(feature = "mprotect"))]
+    let verifier_vks = crate::verify::VerifierRecursionVks::default();
+    let verifier = SP1Verifier::new_with_machine(verifier_vks, machine.clone());
     for (index, (proof, vk)) in proofs.iter().enumerate() {
         let sp1_vk = SP1VerifyingKey { vk: vk.clone() };
         verifier
@@ -131,12 +141,33 @@ pub async fn execute_with_options(
     opts: SP1CoreOpts,
     executor_config: SP1ExecutorConfig,
 ) -> anyhow::Result<(SP1PublicValues, [u8; 32], ExecutionReport)> {
+    execute_with_options_and_machine(
+        program,
+        stdin,
+        context,
+        opts,
+        executor_config,
+        RiscvAir::machine(),
+    )
+    .await
+}
+
+/// Same as [`execute_with_options`] but with a custom machine.
+pub async fn execute_with_options_and_machine(
+    program: Arc<Program>,
+    stdin: SP1Stdin,
+    context: SP1Context<'static>,
+    opts: SP1CoreOpts,
+    executor_config: SP1ExecutorConfig,
+    machine: Machine<SP1Field, RiscvAir<SP1Field>>,
+) -> anyhow::Result<(SP1PublicValues, [u8; 32], ExecutionReport)> {
     // The return values of the spawned tasks.
     enum ExecutorOutput {
         VerifyDone,
         Report(ExecutionReport),
         PublicValues {
             public_values: SP1PublicValues,
+            public_value_digest: [u32; PV_DIGEST_NUM_WORDS],
             #[cfg(feature = "profiling")]
             cycle_tracker: hashbrown::HashMap<String, u64>,
             #[cfg(feature = "profiling")]
@@ -150,16 +181,23 @@ pub async fn execute_with_options(
     let calculate_gas = context.calculate_gas;
     let nonce = context.proof_nonce;
     let max_cycles = context.max_cycles;
+    // Gas estimation chunks at its own dedicated cadence, decoupled from
+    // `minimal_trace_chunk_threshold`. The metered gas depends on the chunk size (each chunk is
+    // treated as a shard for memory-boundary accounting), so it must not track the memory-only
+    // knob that #2793 shrank. See `GAS_TRACE_CHUNK_THRESHOLD`.
     let minimal_trace_chunk_threshold =
-        if context.calculate_gas { Some(opts.minimal_trace_chunk_threshold) } else { None };
+        if context.calculate_gas { Some(opts.gas_trace_chunk_threshold) } else { None };
     let memory_limit = opts.memory_limit;
-    let trace_chunk_slots = opts.trace_chunk_slots;
+    // The gas path uses its own (smaller) slot count: gas chunks are 8× larger, so the SHM ring is
+    // bounded by `gas_trace_chunk_slots × ~2.2 GiB`. This is the standalone gas-estimation run;
+    // proving uses `trace_chunk_slots` on a different path and is unaffected.
+    let trace_chunk_slots = opts.gas_trace_chunk_slots;
     let gas_engine =
         initialize_gas_engine(&executor_config, program.clone(), nonce, opts, calculate_gas);
 
     if context.deferred_proof_verification {
         join_set.spawn_blocking(move || {
-            verify_deferred_proofs(&proofs)?;
+            verify_deferred_proofs(machine, &proofs)?;
             Ok::<_, anyhow::Error>(ExecutorOutput::VerifyDone)
         });
     }
@@ -207,7 +245,9 @@ pub async fn execute_with_options(
                     let total_instructions = report.total_instruction_count();
                     if total_instructions >= max_cycles {
                         tracing::debug!("Cycle limit reached, stopping execution");
-                        return Err(anyhow::anyhow!("cycle limit reached"));
+                        return Err(anyhow::Error::new(ExecutionError::ExceededCycleLimit(
+                            max_cycles,
+                        )));
                     }
                 }
 
@@ -227,10 +267,7 @@ pub async fn execute_with_options(
     // Spawn a blocking task to run the minimal executor.
     let final_vm_state_clone = final_vm_state.clone();
     join_set.spawn_blocking(move || {
-        while let Some(chunk) = minimal_executor
-            .try_execute_chunk()
-            .map_err(|e| anyhow::anyhow!("Execute chunk failed: {e}"))?
-        {
+        while let Some(chunk) = minimal_executor.try_execute_chunk()? {
             let handle = gas_engine
                 .blocking_submit(GasExecutingTask {
                     chunk,
@@ -247,12 +284,14 @@ pub async fn execute_with_options(
         #[cfg(feature = "profiling")]
         let invocation_tracker = minimal_executor.take_invocation_tracker();
 
+        let public_value_digest = minimal_executor.public_value_digest();
         let public_value_stream = minimal_executor.into_public_values_stream();
         let public_values = SP1PublicValues::from(&public_value_stream);
 
         tracing::info!("public_value_stream: {:?}", public_value_stream);
         Ok::<_, anyhow::Error>(ExecutorOutput::PublicValues {
             public_values,
+            public_value_digest,
             #[cfg(feature = "profiling")]
             cycle_tracker,
             #[cfg(feature = "profiling")]
@@ -263,6 +302,7 @@ pub async fn execute_with_options(
     // Wait for all gas calculations to complete.
     let mut final_report = ExecutionReport::default();
     let mut public_values = SP1PublicValues::default();
+    let mut minimal_executor_digest: Option<[u32; PV_DIGEST_NUM_WORDS]> = None;
     #[cfg(feature = "profiling")]
     let mut cycle_tracker_data: Option<(
         hashbrown::HashMap<String, u64>,
@@ -274,12 +314,14 @@ pub async fn execute_with_options(
             Ok(Ok(output)) => match output {
                 ExecutorOutput::PublicValues {
                     public_values: pv,
+                    public_value_digest: pvd,
                     #[cfg(feature = "profiling")]
                     cycle_tracker,
                     #[cfg(feature = "profiling")]
                     invocation_tracker,
                 } => {
                     public_values = pv;
+                    minimal_executor_digest = Some(pvd);
                     #[cfg(feature = "profiling")]
                     {
                         cycle_tracker_data = Some((cycle_tracker, invocation_tracker));
@@ -307,18 +349,19 @@ pub async fn execute_with_options(
         final_report.invocation_tracker = invocation_tracker;
     }
 
-    // Extract the public value digest from the final VM state.
-    let public_value_digest: [u8; 32] = final_vm_state
+    // Extract the public value digest. Prefer the value tracked by the gas-estimating VM (set when
+    // `calculate_gas` is enabled), and fall back to the digest captured by the minimal executor
+    // when gas estimation is disabled and `final_vm_state` is therefore never populated.
+    let digest_words: [u32; PV_DIGEST_NUM_WORDS] = final_vm_state
         .get()
-        .map(|state| {
-            let mut committed_value_digest = [0u8; 32];
-            state.public_value_digest.iter().enumerate().for_each(|(i, word)| {
-                let bytes = word.to_le_bytes();
-                committed_value_digest[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
-            });
-            committed_value_digest
-        })
+        .map(|state| state.public_value_digest)
+        .or(minimal_executor_digest)
         .ok_or(anyhow::anyhow!("Failed to extract public value digest"))?;
+    let mut public_value_digest = [0u8; 32];
+    digest_words.iter().enumerate().for_each(|(i, word)| {
+        let bytes = word.to_le_bytes();
+        public_value_digest[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+    });
 
     Ok((public_values, public_value_digest, final_report))
 }
@@ -327,25 +370,98 @@ pub async fn execute_with_options(
 mod tests {
     use std::sync::Arc;
 
-    use sp1_core_executor::{Program, SP1Context, SP1CoreOpts};
+    use sp1_core_executor::{Program, SP1ContextBuilder, SP1CoreOpts};
     use sp1_core_machine::io::SP1Stdin;
+    use sp1_primitives::{io::SP1PublicValues, Elf};
 
     use super::{execute_with_options, SP1ExecutorConfig};
 
-    #[tokio::test]
-    async fn test_execute_with_optional_gas() {
-        let elf = test_artifacts::FIBONACCI_ELF;
-        let program = Arc::new(Program::from(&elf).unwrap());
+    async fn run(elf: &Elf, calculate_gas: bool) -> (SP1PublicValues, [u8; 32]) {
+        let program = Arc::new(Program::from(elf).unwrap());
         let mut stdin = SP1Stdin::new();
         stdin.write(&10usize);
         let opts = SP1CoreOpts::default();
         let executor_config = SP1ExecutorConfig::default();
 
-        let context = SP1Context::default();
+        let mut context_builder = SP1ContextBuilder::new();
+        context_builder.calculate_gas(calculate_gas);
+        let context = context_builder.build();
+
         let (pv, digest, report) =
             execute_with_options(program, stdin, context, opts, executor_config).await.unwrap();
-
-        assert!(pv.hash() == digest.to_vec() || pv.blake3_hash() == digest.to_vec());
         assert_eq!(report.exit_code, 0);
+        (pv, digest)
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_optional_gas() {
+        // SHA-256 guest, gas estimation enabled (final_vm_state path).
+        let (pv, digest) = run(&test_artifacts::FIBONACCI_ELF, true).await;
+        assert_eq!(pv.hash(), digest.to_vec(), "sha guest digest must match pv.hash() (gas=on)");
+
+        // SHA-256 guest, gas estimation disabled — regression for "Failed to extract public value
+        // digest". The digest must come from the minimal executor's COMMIT tracking, since
+        // `final_vm_state` is never populated when `calculate_gas` is false.
+        let (pv, digest) = run(&test_artifacts::FIBONACCI_ELF, false).await;
+        assert_eq!(pv.hash(), digest.to_vec(), "sha guest digest must match pv.hash() (gas=off)");
+
+        // BLAKE3 guest, gas estimation disabled — guards against the tempting-but-wrong
+        // "always fall back to SP1PublicValues::hash()" shortcut, which would silently use sha256
+        // for a blake3-built guest.
+        let (pv, digest) = run(&test_artifacts::FIBONACCI_BLAKE3_ELF, false).await;
+        assert_eq!(
+            pv.blake3_hash(),
+            digest.to_vec(),
+            "blake3 guest digest must match pv.blake3_hash() (gas=off)",
+        );
+        assert_ne!(
+            pv.hash(),
+            digest.to_vec(),
+            "blake3 guest digest must NOT match pv.hash() (sha256)",
+        );
+
+        // BLAKE3 guest, gas estimation enabled — both paths must agree on the same digest.
+        let (pv, digest) = run(&test_artifacts::FIBONACCI_BLAKE3_ELF, true).await;
+        assert_eq!(
+            pv.blake3_hash(),
+            digest.to_vec(),
+            "blake3 guest digest must match pv.blake3_hash() (gas=on)",
+        );
+    }
+
+    /// The metered gas must not depend on `minimal_trace_chunk_threshold`, which is a memory-only
+    /// knob (#2793 shrank it 8x). Gas chunks at the dedicated `gas_trace_chunk_threshold` cadence,
+    /// so changing the memory threshold must leave the gas estimate unchanged.
+    #[tokio::test]
+    async fn test_gas_independent_of_memory_chunk_threshold() {
+        async fn gas_with(min_chunk_threshold: u64) -> u64 {
+            let program = Arc::new(Program::from(&test_artifacts::FIBONACCI_ELF).unwrap());
+            let mut stdin = SP1Stdin::new();
+            stdin.write(&100_000usize);
+
+            let opts = SP1CoreOpts {
+                minimal_trace_chunk_threshold: min_chunk_threshold,
+                ..SP1CoreOpts::default()
+            };
+            let executor_config = SP1ExecutorConfig::default();
+
+            let mut context_builder = SP1ContextBuilder::new();
+            context_builder.calculate_gas(true);
+            let context = context_builder.build();
+
+            let (_pv, _digest, report) =
+                execute_with_options(program, stdin, context, opts, executor_config).await.unwrap();
+            report.gas().expect("gas should be present when calculate_gas is true")
+        }
+
+        // A tiny memory threshold forces many memory chunks but must not change gas, because the
+        // gas path ignores it in favor of `gas_trace_chunk_threshold`.
+        let tiny = gas_with(1000).await;
+        let default = gas_with(SP1CoreOpts::default().minimal_trace_chunk_threshold).await;
+        assert_eq!(
+            tiny, default,
+            "gas changed with minimal_trace_chunk_threshold ({tiny} vs {default}); \
+             the memory knob is leaking into metered gas",
+        );
     }
 }

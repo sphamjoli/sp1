@@ -30,7 +30,9 @@ pub struct NetworkProveBuilder<'a> {
     pub(crate) verifier: Option<Address>,
     pub(crate) treasury: Option<Address>,
     pub(crate) max_price_per_pgu: Option<u64>,
+    pub(crate) max_price_per_pgu_buffer: Option<u64>,
     pub(crate) auction_timeout: Option<Duration>,
+    pub(crate) private_stdin: bool,
 }
 
 impl NetworkProveBuilder<'_> {
@@ -91,6 +93,22 @@ impl NetworkProveBuilder<'_> {
         self
     }
 
+    /// Enable private stdin for this proof request.
+    ///
+    /// When enabled, the stdin artifact is uploaded to a private S3 prefix and
+    /// the public URI is redacted from `ProofRequest` broadcasts. Only the
+    /// requester, the network's execution oracle, and (post-settlement) the
+    /// assigned fulfiller can download it via the authenticated `GetStdinUri`
+    /// RPC.
+    ///
+    /// This can be used together with [`NetworkProveBuilder::whitelist`] to limit
+    /// which fulfillers that will be able to win the auction and download stdin.
+    #[must_use]
+    pub fn private_stdin(mut self, enabled: bool) -> Self {
+        self.private_stdin = enabled;
+        self
+    }
+
     /// Set the auctioneer for the proof request.
     #[must_use]
     pub fn auctioneer(mut self, auctioneer: Address) -> Self {
@@ -123,6 +141,23 @@ impl NetworkProveBuilder<'_> {
     #[must_use]
     pub fn max_price_per_pgu(mut self, max_price_per_pgu: u64) -> Self {
         self.max_price_per_pgu = Some(max_price_per_pgu);
+        self
+    }
+
+    /// Override the buffer applied to the server-supplied `max_price_per_pgu` default,
+    /// expressed as a percentage. `150` = `1.50x`. Default is
+    /// [`crate::network::DEFAULT_MAX_PRICE_PER_PGU_BUFFER`] (120%). Ignored when
+    /// [`Self::max_price_per_pgu`] is set explicitly.
+    ///
+    /// Values below `100` underbid the server's suggested cap and may leave the request
+    /// without takers; `0` produces a zero cap. If the buffered value overflows `u64`,
+    /// the SDK silently falls back to the unbuffered server default.
+    ///
+    /// Only relevant if the strategy is set to
+    /// [`crate::network::FulfillmentStrategy::Auction`].
+    #[must_use]
+    pub fn max_price_per_pgu_buffer(mut self, pct: u64) -> Self {
+        self.max_price_per_pgu_buffer = Some(pct);
         self
     }
 
@@ -163,6 +198,8 @@ impl NetworkProveBuilder<'_> {
             self.verifier,
             self.treasury,
             self.max_price_per_pgu,
+            self.max_price_per_pgu_buffer,
+            self.private_stdin,
         ))
     }
 }
@@ -206,7 +243,9 @@ impl<'a> ProveRequest<'a, NetworkProver> for NetworkProveBuilder<'a> {
             self.verifier,
             self.treasury,
             self.max_price_per_pgu,
+            self.max_price_per_pgu_buffer,
             self.auction_timeout,
+            self.private_stdin,
         ))
     }
 }

@@ -1,13 +1,26 @@
-//! Example: ZK zerocheck proving that the pointwise product of two MLEs equals a third.
+//! Example: zerocheck proving the pointwise product of two MLEs equals a third,
+//! run against two backends.
 //!
 //! Protocol:
-//! 1. Generate random extension field MLEs p, q and compute r = p * q pointwise
-//! 2. Commit p, q, r via PCS
-//! 3. Verifier samples a random point z_0
-//! 4. Build the composition f(x) = eq(x, z_0) * (p(x) * q(x) - r(x))
-//! 5. Use sumcheck to prove sum of f over the hypercube is 0, producing eval claims at z
-//! 6. Verify eq(z, z_0) (cheap for verifier)
-//! 7. Prove p(z), q(z), r(z) via PCS
+//! 1. Generate random extension-field MLEs p, q and compute r = p * q pointwise.
+//! 2. Commit p, q, r via PCS.
+//! 3. Sample a random point z_0.
+//! 4. Build the composition f(x) = eq(x, z_0) * (p(x) * q(x) - r(x)).
+//! 5. Sumcheck over f with input claim 0, producing component evals at point z.
+//! 6. Tie the component evals to p(z), q(z), r(z) via PCS openings.
+//!
+//! Two functions encode the protocol:
+//!
+//! - `zerocheck_prove`: prover-only — commit + sample + send. No constraints,
+//!   no `View`. Its job is purely to populate the transcript (and, on a prover
+//!   context, the replay log).
+//! - `zerocheck_verify`: reads-and-constrains in one pass. Generic over any
+//!   `ReadingCtx`, so it runs unchanged on the verifier *and* on the prover —
+//!   the prover context implements a non-challenger-touching replay
+//!   `ReadingCtx` that lets it replay its own transcript through the same body
+//!   the verifier uses.
+//!
+//! Driver: `prove(); verify()` on the prover, `verify()` on the verifier.
 
 use itertools::Itertools;
 use rand::{Rng, SeedableRng};
@@ -16,13 +29,17 @@ use slop_algebra::{
     interpolate_univariate_polynomial, AbstractExtensionField, AbstractField, UnivariatePolynomial,
 };
 use slop_challenger::IopCtx;
+use slop_commit::Message;
 use slop_koala_bear::KoalaBearDegree4Duplex;
 use slop_matrix::dense::RowMajorMatrix;
 use slop_merkle_tree::Poseidon2KoalaBear16Prover;
 use slop_multilinear::{Mle, Point};
 use slop_sumcheck::{ComponentPoly, SumcheckPoly, SumcheckPolyBase, SumcheckPolyFirstRound};
-use slop_veil::compiler::{ConstraintCtx, ReadingCtx, SendingCtx};
-use slop_veil::protocols::sumcheck::{SumcheckParam, SumcheckView};
+use slop_veil::compiler::{ReadingCtx, SendingCtx};
+use slop_veil::protocols::sumcheck::{SumcheckInputClaim, SumcheckParam};
+use slop_veil::transparent::{
+    initialize_transparent_prover_and_verifier, TransparentProverCtx, TransparentVerifierCtx,
+};
 use slop_veil::zk::stacked_pcs::{initialize_zk_prover_and_verifier, StackedPcsZkProverCtx};
 use slop_veil::zk::{compute_mask_length, ZkProverCtx, ZkVerifierCtx};
 
@@ -37,12 +54,9 @@ const NUM_VARIABLES: u32 = LOG_NUM_POLYNOMIALS + LOG_ENCODING_VARS;
 
 // ============================================================================
 // Zerocheck composition polynomial: f(x) = eq(z_0, x) * (p(x) * q(x) - r(x))
+// (identical to `zerocheck.rs`)
 // ============================================================================
 
-/// The polynomial f(x) = eq(z_0, x) * (p(x) * q(x) - r(x)) for the zerocheck sumcheck.
-///
-/// Modeled after `ProdcheckPoly` in the Spartan crate. The eq MLE is "succinct" in that
-/// the verifier can compute eq(z, z_0) in O(n) time given both points.
 struct ZerocheckPoly {
     eq_z0: Mle<EF>,
     p: Mle<EF>,
@@ -81,8 +95,6 @@ impl SumcheckPoly<EF> for ZerocheckPoly {
     fn sum_as_poly_in_last_variable(&self, claim: Option<EF>) -> UnivariatePolynomial<EF> {
         assert!(claim.is_some());
 
-        // f(x) = eq(z_0, x) * (p(x) * q(x) - r(x)) is degree 3 in each variable.
-        // We need 4 evaluation points to interpolate a degree-3 univariate.
         let zero = EF::zero();
         let one = EF::one();
         let m_one = -one;
@@ -92,9 +104,6 @@ impl SumcheckPoly<EF> for ZerocheckPoly {
         let mut eval_m_one = EF::zero();
         let mut eval_two = EF::zero();
 
-        // Iterate over pairs (c_0 = evals at even index, c_1 = evals at odd index)
-        // The last variable selects between c_0 (at 0) and c_1 (at 1).
-        // Linear interpolation: val(t) = c_0 + t * (c_1 - c_0) = c_0 * (1-t) + c_1 * t
         for (c_0, c_1) in self
             .eq_z0
             .hypercube_iter()
@@ -113,23 +122,17 @@ impl SumcheckPoly<EF> for ZerocheckPoly {
             let r_0 = c_0.3;
             let r_1 = c_1.3;
 
-            // eval at t=0: eq_0 * (p_0 * q_0 - r_0)
             eval_zero += eq_0 * (p_0 * q_0 - r_0);
 
-            // Precompute differences for evaluating at other points
             let d_eq = eq_0 - eq_1;
             let d_p = p_0 - p_1;
             let d_q = q_0 - q_1;
             let d_r = r_0 - r_1;
 
-            // eval at t=-1: (eq_0 + d_eq) * ((p_0 + d_p) * (q_0 + d_q) - (r_0 + d_r))
             eval_m_one += (eq_0 + d_eq) * ((p_0 + d_p) * (q_0 + d_q) - (r_0 + d_r));
-
-            // eval at t=2: (eq_1 - d_eq) * ((p_1 - d_p) * (q_1 - d_q) - (r_1 - d_r))
             eval_two += (eq_1 - d_eq) * ((p_1 - d_p) * (q_1 - d_q) - (r_1 - d_r));
         }
 
-        // eval at t=1 is derived from the claim: claim = eval_zero + eval_one
         let eval_one = claim.unwrap() - eval_zero;
 
         interpolate_univariate_polynomial(
@@ -158,10 +161,9 @@ impl SumcheckPolyFirstRound<EF> for ZerocheckPoly {
 }
 
 // ============================================================================
-// Data generation
+// Data generation (identical to `zerocheck.rs`)
 // ============================================================================
 
-/// Generate a random EF MLE and its base field version for committing.
 fn generate_random_ef_mle(rng: &mut impl Rng, num_vars: u32) -> (Mle<F>, Mle<EF>) {
     let base_mle = Mle::<F>::rand(rng, 1, num_vars);
     let ef_data: Vec<EF> = base_mle.guts().as_slice().iter().map(|&x| EF::from(x)).collect();
@@ -169,7 +171,6 @@ fn generate_random_ef_mle(rng: &mut impl Rng, num_vars: u32) -> (Mle<F>, Mle<EF>
     (base_mle, ef_mle)
 }
 
-/// Compute pointwise product of two EF MLEs.
 fn pointwise_product(p: &Mle<EF>, q: &Mle<EF>) -> Mle<EF> {
     let p_data = p.guts().as_slice();
     let q_data = q.guts().as_slice();
@@ -177,8 +178,6 @@ fn pointwise_product(p: &Mle<EF>, q: &Mle<EF>) -> Mle<EF> {
     Mle::new(RowMajorMatrix::new(r_data, 1).into())
 }
 
-/// Convert an EF MLE to a base field MLE (truncating to the base field part).
-/// This works because our random MLEs were generated as base field elements lifted to EF.
 fn ef_mle_to_base(mle: &Mle<EF>) -> Mle<F> {
     let data: Vec<F> =
         mle.guts().as_slice().iter().map(|x| AbstractExtensionField::as_base_slice(x)[0]).collect();
@@ -186,64 +185,78 @@ fn ef_mle_to_base(mle: &Mle<EF>) -> Mle<F> {
 }
 
 // ============================================================================
-// Protocol read/constrain functions (shared by prover, verifier, and mask counter)
+// Generic protocol code
 // ============================================================================
 
-struct ZerocheckView<C: ConstraintCtx> {
-    p_oracle: C::MleOracle,
-    q_oracle: C::MleOracle,
-    r_oracle: C::MleOracle,
-    z_0: Point<C::Challenge>,
-    sumcheck_view: SumcheckView<C>,
+/// Prover-only entry point: commit p, q, r; sample `z_0`; build the zerocheck
+/// composition polynomial; run sumcheck with the constant-zero input claim.
+///
+/// Emits no constraints and returns no view — its sole job is to populate the
+/// transcript (and, on a prover context, the replay log). Constraints are built
+/// later by [`zerocheck_verify`], which the prover replays.
+#[allow(clippy::too_many_arguments)]
+fn zerocheck_prove<C, RNG>(
+    ctx: &mut C,
+    p_base: Mle<C::Field>,
+    q_base: Mle<C::Field>,
+    r_base: Mle<C::Field>,
+    p_ef: Mle<EF>,
+    q_ef: Mle<EF>,
+    r_ef: Mle<EF>,
+    rng: &mut RNG,
+) where
+    C: SendingCtx<Challenge = EF, Extension = EF>,
+    RNG: rand::CryptoRng + rand::Rng,
+    rand::distributions::Standard: rand::distributions::Distribution<C::Field>,
+{
+    ctx.commit_mle(Message::from(p_base), rng).expect("commit p failed");
+    ctx.commit_mle(Message::from(q_base), rng).expect("commit q failed");
+    ctx.commit_mle(Message::from(r_base), rng).expect("commit r failed");
+
+    let z_0: Point<EF> = ctx.sample_point(NUM_VARIABLES);
+
+    let eq_z0 = Mle::<EF>::partial_lagrange(&z_0);
+    let zerocheck_poly = ZerocheckPoly { eq_z0, p: p_ef, q: q_ef, r: r_ef };
+
+    let sumcheck_in_claim = SumcheckInputClaim::zero();
+    SumcheckParam::with_component_evals(NUM_VARIABLES, 3, 3).prove(
+        &sumcheck_in_claim,
+        zerocheck_poly,
+        ctx,
+    );
 }
 
-fn zerocheck_read<C: ReadingCtx>(ctx: &mut C) -> ZerocheckView<C> {
-    // Read the three PCS commitments
-    let p_oracle = ctx.read_oracle(LOG_ENCODING_VARS, LOG_NUM_POLYNOMIALS).unwrap();
-    let q_oracle = ctx.read_oracle(LOG_ENCODING_VARS, LOG_NUM_POLYNOMIALS).unwrap();
-    let r_oracle = ctx.read_oracle(LOG_ENCODING_VARS, LOG_NUM_POLYNOMIALS).unwrap();
+/// Unified read+constrain pass. Reads the three committed oracles, samples
+/// `z_0`, runs the sumcheck via [`SumcheckParam::verify`] (which reads *and*
+/// constrains), then ties the reduced claim to `eq(z, z_0) * (p*q - r)` and
+/// registers the PCS opening claims — all in one function, generic over any
+/// `ReadingCtx`. Used by both the verifier and the (replaying) prover.
+fn zerocheck_verify<C: ReadingCtx<Challenge = EF>>(ctx: &mut C) {
+    let p_oracle = ctx.read_oracle(NUM_VARIABLES).unwrap();
+    let q_oracle = ctx.read_oracle(NUM_VARIABLES).unwrap();
+    let r_oracle = ctx.read_oracle(NUM_VARIABLES).unwrap();
 
-    // Read the zerocheck random point z_0
     let z_0 = ctx.sample_point(NUM_VARIABLES);
 
-    // Read the sumcheck proof.
-    // f(x) = eq(z_0, x) * (p(x) * q(x) - r(x)) has degree 3, with 3 component evals (p, q, r).
-    let param = SumcheckParam::with_component_evals(NUM_VARIABLES, 3, 3);
-    let sumcheck_view = param.read(ctx).unwrap();
+    // f(x) = eq(z_0, x) * (p(x) * q(x) - r(x)): degree 3, 3 component evals (p, q, r).
+    let sumcheck_in_claim = SumcheckInputClaim::zero();
+    let out_claim = SumcheckParam::with_component_evals(NUM_VARIABLES, 3, 3)
+        .verify(&sumcheck_in_claim, ctx)
+        .expect("sumcheck verify failed");
 
-    ZerocheckView { p_oracle, q_oracle, r_oracle, z_0, sumcheck_view }
-}
+    let z = Point::from(out_claim.point.clone());
+    let p_eval = out_claim.component_evals[0][0].clone();
+    let q_eval = out_claim.component_evals[0][1].clone();
+    let r_eval = out_claim.component_evals[0][2].clone();
 
-fn zerocheck_build_constraints<C: ConstraintCtx<Challenge = EF>>(
-    ctx: &mut C,
-    view: ZerocheckView<C>,
-) {
-    let z = Point::from(view.sumcheck_view.point.clone());
-
-    let p_eval = view.sumcheck_view.component_evals[0].clone();
-    let q_eval = view.sumcheck_view.component_evals[1].clone();
-    let r_eval = view.sumcheck_view.component_evals[2].clone();
-
-    // Constraint: claimed_eval == eq(z, z_0) * (p(z) * q(z) - r(z))
-    //
-    // eq(z, z_0) is computable in O(n) by the verifier since z (sumcheck challenges)
-    // and z_0 (Fiat-Shamir) are both known field elements.
-    let eq_eval = Mle::<EF>::full_lagrange_eval(&view.z_0, &z);
-
-    // Express as a single polynomial constraint:
-    //   eq(z, z_0) * (p(z) * q(z) - r(z)) - claimed_eval = 0
+    // Constraint: claimed_eval == eq(z, z_0) * (p(z) * q(z) - r(z)).
+    let eq_eval = Mle::<EF>::full_lagrange_eval(&z_0, &z);
     let pq_minus_r = p_eval.clone() * q_eval.clone() - r_eval.clone();
-    let constraint = pq_minus_r * eq_eval - view.sumcheck_view.claimed_eval.clone();
-    ctx.assert_zero(constraint);
+    let constraint = pq_minus_r * eq_eval - out_claim.claimed_eval.clone();
+    ctx.assert_zero(constraint).unwrap();
 
-    // Constraint 3: PCS evaluation claims for p, q, r at point z
-    ctx.assert_mle_multi_eval(
-        vec![(view.p_oracle, p_eval), (view.q_oracle, q_eval), (view.r_oracle, r_eval)],
-        z,
-    );
-
-    // Emit sumcheck round-consistency constraints
-    view.sumcheck_view.build_constraints(ctx).unwrap();
+    // PCS evaluation claims for p, q, r at the shared point z (one multi-eval group).
+    ctx.assert_mle_multi_eval(vec![(p_oracle, p_eval), (q_oracle, q_eval), (r_oracle, r_eval)], z);
 }
 
 // ============================================================================
@@ -254,69 +267,70 @@ fn main() {
     let mut rng = ChaCha20Rng::from_entropy();
 
     eprintln!("Generating random MLEs (num_variables = {NUM_VARIABLES})...");
-
-    // Generate random EF MLEs p, q and compute r = p * q pointwise
     let (p_base, p_ef) = generate_random_ef_mle(&mut rng, NUM_VARIABLES);
     let (q_base, q_ef) = generate_random_ef_mle(&mut rng, NUM_VARIABLES);
     let r_ef = pointwise_product(&p_ef, &q_ef);
     let r_base = ef_mle_to_base(&r_ef);
 
-    // Compute mask length
-    let mask_length = compute_mask_length::<GC, _>(zerocheck_read, |data, ctx| {
-        zerocheck_build_constraints(ctx, data)
-    });
-    eprintln!("Mask length: {mask_length}");
-
-    // Initialize PCS (3 commitments)
-    let (pcs_prover, pcs_verifier) =
+    // ZK backend.
+    eprintln!("\n=== ZK BACKEND ===");
+    let (zk_pcs_prover, zk_pcs_verifier) =
         initialize_zk_prover_and_verifier::<GC, MK>(3, LOG_ENCODING_VARS);
 
-    // === PROVER ===
-    eprintln!("\n=== PROVER ===");
-    let proof = {
+    let zk_proof = {
         let now = std::time::Instant::now();
-
-        let mut ctx: StackedPcsZkProverCtx<GC, MK> =
-            ZkProverCtx::initialize_with_pcs(mask_length, pcs_prover, &mut rng);
-
-        // Commit p, q, r
-        let p_oracle = ctx.commit_mle(p_base, LOG_NUM_POLYNOMIALS, &mut rng).unwrap();
-        let q_oracle = ctx.commit_mle(q_base, LOG_NUM_POLYNOMIALS, &mut rng).unwrap();
-        let r_oracle = ctx.commit_mle(r_base, LOG_NUM_POLYNOMIALS, &mut rng).unwrap();
-
-        // Sample the zerocheck random point z_0
-        let z_0: Point<EF> = ctx.sample_point(NUM_VARIABLES);
-
-        // Build the zerocheck composition polynomial
-        let eq_z0 = Mle::<EF>::partial_lagrange(&z_0);
-        let zerocheck_poly =
-            ZerocheckPoly { eq_z0, p: p_ef.clone(), q: q_ef.clone(), r: r_ef.clone() };
-
-        // Run sumcheck on f(x) = eq(z_0, x) * (p(x) * q(x) - r(x)) with claim = 0
-        let param = SumcheckParam::with_component_evals(NUM_VARIABLES, 3, 3);
-        let sumcheck_view = param.prove(zerocheck_poly, &mut ctx, EF::zero());
-
-        // Build constraints using the shared function
-        let full_prover_view = ZerocheckView { p_oracle, q_oracle, r_oracle, z_0, sumcheck_view };
-        zerocheck_build_constraints(&mut ctx, full_prover_view);
-
-        let proof = ctx.prove(&mut rng);
+        let mask_length = compute_mask_length::<GC>(LOG_ENCODING_VARS, zerocheck_verify);
+        eprintln!("Mask length: {mask_length}");
+        let mut pctx: StackedPcsZkProverCtx<GC, MK> =
+            ZkProverCtx::initialize_with_pcs(mask_length, zk_pcs_prover, &mut rng)
+                .expect("zk init failed");
+        zerocheck_prove(
+            &mut pctx,
+            p_base.clone(),
+            q_base.clone(),
+            r_base.clone(),
+            p_ef.clone(),
+            q_ef.clone(),
+            r_ef.clone(),
+            &mut rng,
+        );
+        // Prover replays the SAME verify body to build constraints.
+        zerocheck_verify(&mut pctx);
+        let proof = pctx.prove(&mut rng).expect("zk prove failed");
         eprintln!("Prover time: {:?}", now.elapsed());
         proof
     };
-
-    // === VERIFIER ===
-    eprintln!("\n=== VERIFIER ===");
     {
-        let now = std::time::Instant::now();
-
-        let mut ctx = ZkVerifierCtx::init(proof, Some(pcs_verifier));
-        let verifier_view = zerocheck_read(&mut ctx);
-        zerocheck_build_constraints(&mut ctx, verifier_view);
-        ctx.verify().expect("verification failed");
-
-        eprintln!("Verifier time: {:?}", now.elapsed());
+        let mut vctx = ZkVerifierCtx::init(zk_proof, Some(zk_pcs_verifier));
+        zerocheck_verify(&mut vctx);
+        vctx.verify().expect("zk verification failed");
     }
+    eprintln!("ZK backend: PASSED");
 
-    eprintln!("\n=== PASSED ===");
+    // Transparent backend.
+    eprintln!("\n=== TRANSPARENT BACKEND ===");
+    let (stacked_prover, stacked_verifier) = initialize_transparent_prover_and_verifier::<GC, MK>(
+        3,
+        LOG_ENCODING_VARS,
+        LOG_NUM_POLYNOMIALS,
+    );
+
+    let transparent_proof = {
+        let now = std::time::Instant::now();
+        let mut pctx: TransparentProverCtx<GC, MK> =
+            TransparentProverCtx::initialize(stacked_prover);
+        zerocheck_prove(&mut pctx, p_base, q_base, r_base, p_ef, q_ef, r_ef, &mut rng);
+        zerocheck_verify(&mut pctx);
+        let proof = pctx.prove(&mut rng).expect("transparent prove failed");
+        eprintln!("Prover time: {:?}", now.elapsed());
+        proof
+    };
+    {
+        let mut vctx = TransparentVerifierCtx::<GC>::new(transparent_proof, Some(stacked_verifier));
+        zerocheck_verify(&mut vctx);
+        vctx.verify().expect("transparent verification failed");
+    }
+    eprintln!("Transparent backend: PASSED");
+
+    eprintln!("\n=== ALL PASSED ===");
 }

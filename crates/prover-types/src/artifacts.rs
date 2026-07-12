@@ -6,10 +6,33 @@ use futures_util::future::FutureExt;
 use hashbrown::{HashMap, HashSet};
 use mti::prelude::{MagicTypeIdExt, V7};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock};
 use tracing::Instrument;
 
 use crate::utils::{await_blocking, await_scoped_vec};
+
+/// Reservation of space in the artifact store for one in-flight shard.
+///
+/// Held from `upload()` until the downstream consumer deletes the artifact;
+/// dropping releases the reservation. Stores without a memory ceiling (S3,
+/// in-memory) return [`ShardPermit::noop`] so producers can call
+/// `acquire_shard_permit` uniformly.
+pub struct ShardPermit {
+    // Dropping releases the underlying semaphore slot.
+    _guard: Option<OwnedSemaphorePermit>,
+}
+
+impl ShardPermit {
+    /// Zero-cost permit for stores without a memory ceiling.
+    pub const fn noop() -> Self {
+        Self { _guard: None }
+    }
+
+    /// Wrap a real semaphore permit from a memory-bounded store.
+    pub const fn new(guard: OwnedSemaphorePermit) -> Self {
+        Self { _guard: Some(guard) }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ArtifactType {
@@ -19,6 +42,7 @@ pub enum ArtifactType {
     Proof,
     Groth16Circuit,
     PlonkCircuit,
+    PrivateStdin,
 }
 
 impl fmt::Display for ArtifactType {
@@ -30,6 +54,7 @@ impl fmt::Display for ArtifactType {
             Self::Proof => write!(f, "Proof"),
             Self::Groth16Circuit => write!(f, "Groth16Circuit"),
             Self::PlonkCircuit => write!(f, "PlonkCircuit"),
+            Self::PrivateStdin => write!(f, "PrivateStdin"),
         }
     }
 }
@@ -151,6 +176,17 @@ pub trait ArtifactClient: Send + Sync + Clone + 'static {
         artifacts: &[impl ArtifactId],
         artifact_type: ArtifactType,
     ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Reserve space for an in-flight shard artifact. Default: no-op.
+    /// Memory-bounded stores (Redis) override to return a real permit sized
+    /// from their memory ceiling; hold it until the consumer deletes the
+    /// artifact, then drop to release.
+    fn acquire_shard_permit(
+        &self,
+        _artifact: &impl ArtifactId,
+    ) -> impl Future<Output = ShardPermit> + Send {
+        async { ShardPermit::noop() }
+    }
 
     fn try_delete(
         &self,
@@ -295,10 +331,67 @@ pub trait ArtifactClient: Send + Sync + Clone + 'static {
     }
 }
 
+/// A proof-scoped index of live in-memory artifacts, shared between the local
+/// worker client (which records a proof's artifacts as it submits tasks) and
+/// [`InMemoryArtifactClient`] (which drops them as they are deleted). Because the
+/// deleter maintains it, it only ever holds artifacts that are still live - so it
+/// stays bounded - and `take` returns whatever a proof leaked so it can be freed.
+#[derive(Clone, Default)]
+pub struct ProofArtifacts(Arc<std::sync::Mutex<ProofArtifactsInner>>);
+
+#[derive(Default)]
+struct ProofArtifactsInner {
+    by_proof: HashMap<String, HashSet<String>>,
+    of_artifact: HashMap<String, String>,
+}
+
+impl ProofArtifacts {
+    /// Record `artifact` as belonging to `proof`.
+    pub fn track(&self, proof: &str, artifact: &str) {
+        let mut g = self.0.lock().unwrap();
+        g.by_proof.entry(proof.to_owned()).or_default().insert(artifact.to_owned());
+        g.of_artifact.insert(artifact.to_owned(), proof.to_owned());
+    }
+
+    /// Drop `artifact` from the index (called when it is deleted).
+    pub fn untrack(&self, artifact: &str) {
+        let mut g = self.0.lock().unwrap();
+        if let Some(proof) = g.of_artifact.remove(artifact) {
+            if let Some(set) = g.by_proof.get_mut(&proof) {
+                set.remove(artifact);
+                if set.is_empty() {
+                    g.by_proof.remove(&proof);
+                }
+            }
+        }
+    }
+
+    /// Remove and return the artifacts still tracked for `proof` (the ones it
+    /// leaked - everything else was already deleted and untracked).
+    pub fn take(&self, proof: &str) -> HashSet<String> {
+        let mut g = self.0.lock().unwrap();
+        let ids = g.by_proof.remove(proof).unwrap_or_default();
+        for id in &ids {
+            g.of_artifact.remove(id);
+        }
+        ids
+    }
+
+    /// Total number of tracked (live) artifacts across all proofs.
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap().of_artifact.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[derive(Clone)]
 pub struct InMemoryArtifactClient {
     artifacts: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     refs: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    index: ProofArtifacts,
 }
 
 impl fmt::Debug for InMemoryArtifactClient {
@@ -309,9 +402,16 @@ impl fmt::Debug for InMemoryArtifactClient {
 
 impl InMemoryArtifactClient {
     pub fn new() -> Self {
+        Self::with_index(ProofArtifacts::default())
+    }
+
+    /// Create a client whose deletions also prune `index`. Share one index with
+    /// the local worker client so a proof's artifacts drop out as they go.
+    pub fn with_index(index: ProofArtifacts) -> Self {
         Self {
             artifacts: Arc::new(RwLock::new(HashMap::new())),
             refs: Arc::new(Mutex::new(HashMap::new())),
+            index,
         }
     }
 }
@@ -354,8 +454,8 @@ impl ArtifactClient for InMemoryArtifactClient {
     }
 
     async fn delete(&self, artifact: &impl ArtifactId, _artifact_type: ArtifactType) -> Result<()> {
-        let mut artifacts = self.artifacts.write().await;
-        artifacts.remove(artifact.id());
+        self.artifacts.write().await.remove(artifact.id());
+        self.index.untrack(artifact.id());
         Ok(())
     }
 
@@ -364,9 +464,17 @@ impl ArtifactClient for InMemoryArtifactClient {
         artifacts: &[impl ArtifactId],
         _artifact_type: ArtifactType,
     ) -> Result<()> {
-        let mut artifact_map = self.artifacts.write().await;
+        // Drop bytes first under the tokio lock, then prune the (independent)
+        // proof-artifact index. Splitting the critical sections keeps the tokio
+        // write lock from being held while we churn the index's std mutex.
+        {
+            let mut artifact_map = self.artifacts.write().await;
+            for artifact in artifacts {
+                artifact_map.remove(artifact.id());
+            }
+        }
         for artifact in artifacts {
-            artifact_map.remove(artifact.id());
+            self.index.untrack(artifact.id());
         }
         Ok(())
     }

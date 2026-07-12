@@ -1,10 +1,16 @@
 use std::env;
 
 use sp1_core_executor::SP1CoreOpts;
+use sp1_core_machine::riscv::RiscvAir;
+use sp1_hypercube::Machine;
+use sp1_primitives::SP1Field;
 
-use crate::worker::{
-    SP1ControllerConfig, SP1CoreProverConfig, SP1DeferredProverConfig, SP1ProverConfig,
-    SP1RecursionProverConfig,
+use crate::{
+    shapes::SP1RecursionProofShape,
+    worker::{
+        SP1ControllerConfig, SP1CoreProverConfig, SP1DeferredProverConfig, SP1ProverConfig,
+        SP1RecursionProverConfig,
+    },
 };
 
 #[derive(Clone)]
@@ -13,8 +19,8 @@ pub struct SP1WorkerConfig {
     pub prover_config: SP1ProverConfig,
 }
 
-impl Default for SP1WorkerConfig {
-    fn default() -> Self {
+impl SP1WorkerConfig {
+    pub fn new(machine: Machine<SP1Field, RiscvAir<SP1Field>>) -> Self {
         // Build the core config using data from environment or default values.
         //
         // TODO: base default values on system information.
@@ -95,7 +101,6 @@ impl Default for SP1WorkerConfig {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(DEFAULT_NORMALIZE_PROGRAM_CACHE_SIZE);
-        let dump_shard_dir = env::var("SP1_DUMP_SHARD_DIR").ok();
 
         let core_prover_config = SP1CoreProverConfig {
             num_core_workers,
@@ -105,7 +110,6 @@ impl Default for SP1WorkerConfig {
             normalize_program_cache_size,
             use_fixed_pk,
             verify_intermediates,
-            dump_shard_dir,
         };
 
         // Build the recursion prover config.
@@ -137,6 +141,8 @@ impl Default for SP1WorkerConfig {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_COMPOSE_ARITY);
+        let reduce_shape =
+            SP1RecursionProofShape::retrieve_or_compute_reduce_shape(machine, max_compose_arity);
 
         let recursion_prover_config = SP1RecursionProverConfig::new(
             num_prepare_reduce_workers,
@@ -147,6 +153,7 @@ impl Default for SP1WorkerConfig {
             recursion_prover_buffer_size,
             max_compose_arity,
             verify_intermediates,
+            reduce_shape,
         );
 
         // Build the deferred prover config.
@@ -198,5 +205,9 @@ pub(crate) const DEFAULT_NUM_DEFERRED_WORKERS: usize = 4;
 pub(crate) const DEFAULT_DEFERRED_BUFFER_SIZE: usize = 2;
 
 // Default values for the gas executor config.
-pub(crate) const DEFAULT_NUM_GAS_EXECUTOR_WORKERS: usize = 4;
-pub(crate) const DEFAULT_GAS_EXECUTOR_BUFFER_SIZE: usize = 4;
+//
+// Matched to `DEFAULT_GAS_TRACE_CHUNK_SLOTS` (2): each in-flight gas chunk pins one SHM ring slot,
+// so only ~`gas_trace_chunk_slots` chunks can be processed concurrently. More workers than slots
+// would just sit idle, so the defaults are kept in step with the gas ring-buffer size.
+pub(crate) const DEFAULT_NUM_GAS_EXECUTOR_WORKERS: usize = 2;
+pub(crate) const DEFAULT_GAS_EXECUTOR_BUFFER_SIZE: usize = 2;

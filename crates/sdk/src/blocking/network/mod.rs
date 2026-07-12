@@ -68,7 +68,9 @@ impl Prover for NetworkProver {
             verifier: None,
             treasury: None,
             max_price_per_pgu: None,
+            max_price_per_pgu_buffer: None,
             auction_timeout: None,
+            private_stdin: false,
         }
     }
 

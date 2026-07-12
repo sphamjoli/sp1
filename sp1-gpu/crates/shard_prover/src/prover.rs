@@ -8,9 +8,8 @@ use slop_jagged::{
     unzip_and_prefix_sums, JaggedLittlePolynomialProverParams, JaggedPcsProof, JaggedProverData,
     JaggedProverError, PrefixSumsMaxLogRowCount,
 };
-use slop_multilinear::{Evaluations, MleEval, MultilinearPcsVerifier, Point};
-use sp1_gpu_air::air_block::BlockAir;
-use sp1_gpu_air::SymbolicProverFolder;
+use slop_multilinear::{MleEval, MultilinearPcsVerifier, Point};
+use sp1_gpu_air::ir::{ChunkBudget, DagBuilder};
 use sp1_gpu_basefold::{CudaStackedPcsProverData, DeviceGrindingChallenger, FriCudaProver};
 use sp1_gpu_challenger::FromHostChallengerSync;
 use sp1_gpu_cudart::PinnedBuffer;
@@ -22,8 +21,7 @@ use sp1_gpu_logup_gkr::{prove_logup_gkr, CudaLogUpGkrOptions, Interactions};
 use sp1_gpu_merkle_tree::{CudaTcsProver, SingleLayerMerkleTreeProverError};
 use sp1_gpu_tracegen::CudaTracegenAir;
 use sp1_gpu_utils::{Ext, Felt, JaggedTraceMle};
-use sp1_gpu_zerocheck::zerocheck;
-use sp1_gpu_zerocheck::CudaEvalResult;
+use sp1_gpu_zerocheck::prover::{upload_machine_bytecode, zerocheck, MachineBytecode};
 use sp1_hypercube::prover::ZerocheckAir;
 use sp1_hypercube::{
     air::{MachineAir, MachineProgram},
@@ -31,8 +29,9 @@ use sp1_hypercube::{
     Machine, MachineVerifyingKey, ShardProof,
 };
 use sp1_hypercube::{SP1PcsProof, ShardContextImpl};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::iter::once;
+use std::vec;
 use std::{marker::PhantomData, sync::Arc};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -42,7 +41,7 @@ pub trait CudaShardProverComponents<GC: IopCtx>: Send + Sync + 'static {
     type P: CudaTcsProver<GC>;
     type Air: CudaTracegenAir<GC::F>
         + ZerocheckAir<Felt, Ext>
-        + for<'a> BlockAir<SymbolicProverFolder<'a>>;
+        + for<'a> slop_air::Air<DagBuilder<'a>>;
     type C: MultilinearPcsVerifier<GC> + Send + Sync;
     /// The device challenger type used for GPU-based challenger operations.
     type DeviceChallenger: sp1_gpu_jagged_assist::AsMutRawChallenger
@@ -63,7 +62,7 @@ impl<GC: IopCtx, PC: CudaShardProverComponents<GC>> Clone for CudaShardProver<GC
     }
 }
 
-impl<GC: IopCtx, PC: CudaShardProverComponents<GC>> CudaShardProver<GC, PC> {
+impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>> CudaShardProver<GC, PC> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         trace_buffers: Arc<WorkerQueue<PinnedBuffer<GC::F>>>,
@@ -73,10 +72,15 @@ impl<GC: IopCtx, PC: CudaShardProverComponents<GC>> CudaShardProver<GC, PC> {
         max_trace_size: usize,
         backend: TaskScope,
         all_interactions: BTreeMap<String, Arc<Interactions<GC::F, TaskScope>>>,
-        all_zerocheck_programs: BTreeMap<String, CudaEvalResult>,
         recompute_first_layer: bool,
         drop_ldes: bool,
     ) -> Self {
+        // Compile + upload the whole machine's zerocheck bytecode once.
+        // It's machine-stable, so every shard reuses this single upload.
+        let machine_bytecode = {
+            let chip_set: BTreeSet<_> = machine.chips().iter().cloned().collect();
+            Arc::new(upload_machine_bytecode(&chip_set, ChunkBudget::recommended(), &backend))
+        };
         Self {
             inner: Arc::new(CudaShardProverInner {
                 trace_buffers,
@@ -86,12 +90,45 @@ impl<GC: IopCtx, PC: CudaShardProverComponents<GC>> CudaShardProver<GC, PC> {
                 max_trace_size,
                 backend,
                 all_interactions,
-                all_zerocheck_programs,
+                machine_bytecode,
                 recompute_first_layer,
                 drop_ldes,
                 _marker: PhantomData,
             }),
         }
+    }
+}
+
+impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>> CudaShardProver<GC, PC> {
+    /// Prove trusted evaluations for a shard.
+    #[allow(clippy::type_complexity)]
+    pub fn prove_trusted_evaluations(
+        &self,
+        eval_point: Point<Ext>,
+        evaluation_claims: Rounds<MleEval<Ext, TaskScope>>,
+        all_mles: &JaggedTraceMle<Felt, TaskScope>,
+        prover_data: Rounds<&JaggedProverData<GC, CudaStackedPcsProverData<GC>>>,
+        challenger: &mut GC::Challenger,
+    ) -> Result<
+        JaggedPcsProof<GC, <PC::C as MultilinearPcsVerifier<GC>>::Proof>,
+        JaggedProverError<CudaShardProverError>,
+    >
+    where
+        GC::Challenger: DeviceGrindingChallenger<Witness = GC::F>,
+        GC::Challenger: slop_challenger::FieldChallenger<
+            <GC::Challenger as slop_challenger::GrindingChallenger>::Witness,
+        >,
+        SP1PcsProof<GC>: Into<<PC::C as MultilinearPcsVerifier<GC>>::Proof>,
+        TaskScope:
+            sp1_gpu_jagged_assist::BranchingProgramKernel<GC::F, GC::EF, PC::DeviceChallenger>,
+    {
+        self.inner.prove_trusted_evaluations(
+            eval_point,
+            evaluation_claims,
+            all_mles,
+            prover_data,
+            challenger,
+        )
     }
 }
 
@@ -105,7 +142,11 @@ pub(crate) struct CudaShardProverInner<GC: IopCtx, PC: CudaShardProverComponents
     pub max_trace_size: usize,
     pub backend: TaskScope,
     pub all_interactions: BTreeMap<String, Arc<Interactions<GC::F, TaskScope>>>,
-    pub all_zerocheck_programs: BTreeMap<String, CudaEvalResult>,
+    /// The whole machine's DAG-native bytecode, compiled and uploaded to
+    /// the GPU once at prover construction. The bytecode is machine-stable
+    /// (cluster-independent — see `compile_chips`), so every shard reuses
+    /// this single upload instead of re-compiling + re-uploading per shard.
+    pub machine_bytecode: Arc<MachineBytecode>,
     pub recompute_first_layer: bool,
     pub drop_ldes: bool,
     pub _marker: PhantomData<GC>,
@@ -189,7 +230,7 @@ where
     ) {
         // Get the initial global cumulative sum and pc start.
         let pc_start = program.pc_start();
-        let enable_untrusted_programs = program.enable_untrusted_programs();
+        let untrusted_config = program.untrusted_config();
         let initial_global_cumulative_sum = if let Some(vk) = vk {
             vk.initial_global_cumulative_sum
         } else {
@@ -229,7 +270,7 @@ where
                     pc_start,
                     initial_global_cumulative_sum,
                     trace_data,
-                    enable_untrusted_programs,
+                    untrusted_config,
                 )
             }
         })
@@ -370,56 +411,12 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         .map_err(JaggedProverError::BatchPcsProverError)
     }
 
-    pub fn round_stacked_evaluations(
-        &self,
-        stacked_point: &Point<Ext>,
-        jagged_trace_mle: &JaggedTraceMle<Felt, TaskScope>,
-    ) -> Rounds<Evaluations<Ext, TaskScope>> {
-        let backend = jagged_trace_mle.backend();
-        let log_stacking_height = stacked_point.len();
-        let stacking_height = 1 << log_stacking_height;
-        let preprocessed_stacked_size =
-            jagged_trace_mle.dense().preprocessed_offset / stacking_height;
-        let total_preprocessed_size = stacking_height * preprocessed_stacked_size;
-
-        let device_point = DevicePoint::from_host(stacked_point, backend).unwrap();
-
-        // todo: remove this assert, it's kinda useless
-        assert!(total_preprocessed_size == jagged_trace_mle.dense().preprocessed_offset);
-        let lagrange = device_point.partial_lagrange();
-
-        let main_virtual_tensor =
-            jagged_trace_mle.dense().main_virtual_tensor(log_stacking_height as u32);
-
-        let preprocessed_virtual_tensor =
-            jagged_trace_mle.dense().preprocessed_virtual_tensor(log_stacking_height as u32);
-
-        let preprocessed_evaluations = MleEval::new(sp1_gpu_cudart::dot_along_dim_view(
-            preprocessed_virtual_tensor,
-            lagrange.guts().as_view(),
-            1,
-        ));
-
-        let main_evaluations = MleEval::new(sp1_gpu_cudart::dot_along_dim_view(
-            main_virtual_tensor,
-            lagrange.guts().as_view(),
-            1,
-        ));
-
-        let preprocessed_evaluations =
-            Evaluations { round_evaluations: vec![preprocessed_evaluations] };
-
-        let main_evaluations = Evaluations { round_evaluations: vec![main_evaluations] };
-
-        Rounds::from_iter([preprocessed_evaluations, main_evaluations])
-    }
-
     /// Prove trusted evaluations (sync version).
     #[allow(clippy::type_complexity)]
     pub fn prove_trusted_evaluations(
         &self,
         eval_point: Point<Ext>,
-        evaluation_claims: Rounds<Evaluations<Ext, TaskScope>>,
+        evaluation_claims: Rounds<MleEval<Ext, TaskScope>>,
         all_mles: &JaggedTraceMle<Felt, TaskScope>,
         prover_data: Rounds<&JaggedProverData<GC, CudaStackedPcsProverData<GC>>>,
         challenger: &mut GC::Challenger,
@@ -448,13 +445,11 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
 
         let z_row = eval_point.clone();
 
-        let backend = evaluation_claims[0][0].backend().clone();
+        let backend = evaluation_claims[0].backend().clone();
 
         // First, allocate a buffer for all of the column claims on device.
-        let total_column_claims = evaluation_claims
-            .iter()
-            .map(|evals| evals.iter().map(|evals| evals.num_polynomials()).sum::<usize>())
-            .sum::<usize>();
+        let total_column_claims =
+            evaluation_claims.iter().map(|evals| evals.num_polynomials()).sum::<usize>();
 
         // Add in the dummy padding columns added during the stacked PCS commitment.
         let total_len = total_column_claims
@@ -466,10 +461,8 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         // Then, copy the column claims from the evaluation claims into the buffer, inserting extra
         // zeros for the dummy columns.
         for (column_claim_round, data) in evaluation_claims.into_iter().zip(prover_data.iter()) {
-            for column_claim in column_claim_round.into_iter() {
-                column_claims
-                    .extend_from_device_slice(column_claim.into_evaluations().as_buffer())?;
-            }
+            column_claims
+                .extend_from_device_slice(column_claim_round.into_evaluations().as_buffer())?;
             column_claims
                 .extend_from_host_slice(vec![Ext::zero(); data.padding_column_count].as_slice())?;
         }
@@ -515,9 +508,12 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
 
         let sumcheck_poly = generate_jagged_sumcheck_poly(all_mles, eq_z_col, eq_z_row);
 
-        let (sumcheck_proof, component_poly_evals) = tracing::debug_span!("jagged sumcheck")
-            .in_scope(|| jagged_sumcheck(sumcheck_poly, challenger, sumcheck_claim));
+        let log_stacking_height = self.basefold_prover.log_height as usize;
 
+        let (sumcheck_proof, component_poly_evals, column_evals) =
+            tracing::debug_span!("jagged sumcheck").in_scope(|| {
+                jagged_sumcheck(sumcheck_poly, challenger, sumcheck_claim, log_stacking_height)
+            });
         let final_eval_point = sumcheck_proof.point_and_eval.0.clone();
 
         // Use sync GPU jagged evaluation proof
@@ -528,6 +524,7 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
                 &z_col,
                 &final_eval_point,
                 challenger,
+                component_poly_evals[1],
                 &backend,
             )
         });
@@ -547,40 +544,23 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
 
         let final_eval_point = sumcheck_proof.point_and_eval.0.clone();
 
-        let (_, stack_point) = final_eval_point
-            .split_at(final_eval_point.dimension() - self.basefold_prover.log_height as usize);
+        let (_, stack_point) =
+            final_eval_point.split_at(final_eval_point.dimension() - log_stacking_height);
 
-        let batch_evaluations = self.round_stacked_evaluations(&stack_point, all_mles);
+        // Copy column evals to host once and reuse for the challenger transcript, the basefold
+        // call, and the SP1PcsProof field.
+        let column_evals_host = column_evals.to_host().unwrap();
 
         challenger.observe_ext_element(component_poly_evals[0]);
-
-        let mut host_batch_evaluations = Rounds::new();
-        for round_evals in batch_evaluations.iter() {
-            let mut host_round_evals = vec![];
-            for eval in round_evals.iter() {
-                let host_eval =
-                    sp1_gpu_cudart::DeviceTensor::copy_to_host(eval.evaluations()).unwrap();
-                host_round_evals.extend(host_eval.into_buffer().into_vec());
-            }
-            let host_round_evals = Evaluations::new(vec![host_round_evals.into()]);
-            host_batch_evaluations.push(host_round_evals);
-        }
-
-        for round in batch_evaluations.iter() {
-            for claim in round.iter() {
-                let host_claim =
-                    sp1_gpu_cudart::DeviceTensor::copy_to_host(claim.evaluations()).unwrap();
-                for evaluation in host_claim.into_buffer().into_vec() {
-                    challenger.observe_ext_element(evaluation);
-                }
-            }
+        for &evaluation in &column_evals_host {
+            challenger.observe_ext_element(evaluation);
         }
 
         let pcs_proof = tracing::debug_span!("prove trusted evaluations basefold")
             .in_scope(|| {
                 self.basefold_prover.prove_trusted_evaluations_basefold(
                     stack_point,
-                    batch_evaluations,
+                    column_evals_host.clone(),
                     all_mles,
                     stacked_prover_data,
                     challenger,
@@ -594,10 +574,17 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
             .map(|(r, c)| r.into_iter().zip(c).collect())
             .collect();
 
-        let host_batch_evaluations = host_batch_evaluations
-            .into_iter()
-            .map(|round| round.into_iter().flatten().collect::<MleEval<_>>())
-            .collect::<Rounds<_>>();
+        let preprocessed_stacked_size =
+            all_mles.dense().preprocessed_offset / (1 << log_stacking_height);
+        let mut prep_evals_host = column_evals_host;
+        let main_evals_host = prep_evals_host.split_off(preprocessed_stacked_size);
+
+        let host_batch_evaluations: Rounds<MleEval<Ext>> = Rounds {
+            rounds: vec![
+                MleEval::new(prep_evals_host.into()),
+                MleEval::new(main_evals_host.into()),
+            ],
+        };
 
         let stacked_basefold_proof =
             SP1PcsProof { basefold_proof: pcs_proof, batch_evaluations: host_batch_evaluations };
@@ -687,12 +674,15 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
         // Get the challenge for batching the evaluations from the GKR proof.
         let gkr_opening_batch_challenge = challenger.sample_ext_element::<GC::EF>();
 
-        // Generate the zerocheck proof.
+        // Generate the zerocheck proof via the DAG-native fused-kernel path.
+        // The bytecode is compiled + uploaded once per machine at prover
+        // construction (see `machine_bytecode`); `zerocheck` just selects
+        // this shard's chips from it.
         let (shard_open_values, zerocheck_partial_sumcheck_proof) =
             tracing::debug_span!("zerocheck").in_scope(|| {
                 zerocheck(
                     shard_chips,
-                    &self.all_zerocheck_programs,
+                    &self.machine_bytecode,
                     traces,
                     batching_challenge,
                     gkr_opening_batch_challenge,
@@ -705,34 +695,40 @@ impl<GC: IopCtx<F = Felt, EF = Ext>, PC: CudaShardProverComponents<GC>>
 
         // Get the evaluation point for the trace polynomials.
         let evaluation_point = zerocheck_partial_sumcheck_proof.point_and_eval.0.clone();
-        let mut preprocessed_evaluation_claims: Option<Evaluations<GC::EF, TaskScope>> = None;
-        let mut main_evaluation_claims = Evaluations::new(vec![]);
+        let mut preprocessed_host: Vec<GC::EF> = Vec::new();
+        let mut main_host: Vec<GC::EF> = Vec::new();
+        let mut has_preprocessed = false;
 
         let alloc = self.backend.clone();
 
-        for (_, open_values) in shard_open_values.chips.iter() {
+        for open_values in shard_open_values.chips.values() {
             let prep_local = &open_values.preprocessed.local;
             let main_local = &open_values.main.local;
             if !prep_local.is_empty() {
-                let host_mle_eval = MleEval::from(prep_local.clone());
-                let device_tensor =
-                    sp1_gpu_cudart::DeviceTensor::from_host(host_mle_eval.evaluations(), &alloc)
-                        .unwrap();
-                let preprocessed_evals = MleEval::new(device_tensor.into_inner());
-                if let Some(preprocessed_claims) = preprocessed_evaluation_claims.as_mut() {
-                    preprocessed_claims.push(preprocessed_evals);
-                } else {
-                    let evals = Evaluations::new(vec![preprocessed_evals]);
-                    preprocessed_evaluation_claims = Some(evals);
-                }
+                has_preprocessed = true;
+                preprocessed_host.extend_from_slice(prep_local);
             }
-            let host_mle_eval = MleEval::from(main_local.clone());
-            let device_tensor =
-                sp1_gpu_cudart::DeviceTensor::from_host(host_mle_eval.evaluations(), &alloc)
-                    .unwrap();
-            let main_evals = MleEval::new(device_tensor.into_inner());
-            main_evaluation_claims.push(main_evals);
+            main_host.extend_from_slice(main_local);
         }
+
+        let main_evaluation_claims = MleEval::new(
+            sp1_gpu_cudart::DeviceTensor::from_host(
+                &MleEval::from(main_host).into_evaluations(),
+                &alloc,
+            )
+            .unwrap()
+            .into_inner(),
+        );
+        let preprocessed_evaluation_claims = has_preprocessed.then(|| {
+            MleEval::new(
+                sp1_gpu_cudart::DeviceTensor::from_host(
+                    &MleEval::from(preprocessed_host).into_evaluations(),
+                    &alloc,
+                )
+                .unwrap()
+                .into_inner(),
+            )
+        });
 
         let round_evaluation_claims = preprocessed_evaluation_claims
             .into_iter()
@@ -777,7 +773,6 @@ mod tests {
     use slop_tensor::Tensor;
     use sp1_core_machine::io::SP1Stdin;
     use sp1_core_machine::riscv::RiscvAir;
-    use sp1_gpu_air::codegen_cuda_eval;
     use sp1_gpu_cudart::run_in_place;
     use sp1_gpu_jagged_tracegen::test_utils::tracegen_setup::{
         self, CORE_MAX_LOG_ROW_COUNT, LOG_STACKING_HEIGHT,
@@ -841,12 +836,6 @@ mod tests {
                 all_interactions.insert(chip.name().to_string(), Arc::new(device_interactions));
             }
 
-            let mut cache = BTreeMap::new();
-            for chip in machine.chips().iter() {
-                let result = codegen_cuda_eval(chip.air.as_ref());
-                cache.insert(chip.name().to_string(), result);
-            }
-
             let num_workers = 1;
             let mut trace_buffers = Vec::with_capacity(num_workers);
             for _ in 0..num_workers {
@@ -854,11 +843,15 @@ mod tests {
                 trace_buffers.push(buffer);
             }
 
+            let machine_bytecode = {
+                let chip_set: BTreeSet<_> = machine.chips().iter().cloned().collect();
+                Arc::new(upload_machine_bytecode(&chip_set, ChunkBudget::recommended(), &scope))
+            };
             let shard_prover_inner: CudaShardProverInner<TestGC, TestProverComponentsImpl> =
                 CudaShardProverInner {
                     trace_buffers: Arc::new(WorkerQueue::new(trace_buffers)),
                     all_interactions,
-                    all_zerocheck_programs: cache,
+                    machine_bytecode,
                     max_log_row_count: CORE_MAX_LOG_ROW_COUNT,
                     basefold_prover,
                     max_trace_size: CORE_MAX_TRACE_SIZE as usize,
@@ -886,21 +879,21 @@ mod tests {
 
             let prover_data = Rounds::from_iter([&preprocessed_prover_data, &main_prover_data]);
 
-            // The evaluation_claims are already on host (CpuBackend).
-            // We need to convert them to device evaluations for the prover.
+            // The evaluation_claims are already on host (CpuBackend) and split per chip.
+            // Pack each round's per-chip evaluations into a single host buffer, then upload
+            // once per round to the device.
             let mut new_evaluation_claims = Vec::new();
             for round_evals in evaluation_claims.iter() {
-                let mut round_claims = Vec::new();
+                let mut round_host: Vec<Ext> = Vec::new();
                 for eval in round_evals.iter() {
-                    // Copy the host MleEval to device
-                    let device_tensor =
-                        sp1_gpu_cudart::DeviceTensor::from_host(eval.evaluations(), &scope)
-                            .unwrap();
-                    let device_eval = MleEval::new(device_tensor.into_inner());
-                    round_claims.push(device_eval);
+                    round_host.extend_from_slice(eval.to_vec().as_slice());
                 }
-                let evals = Evaluations::new(round_claims);
-                new_evaluation_claims.push(evals);
+                let device_tensor = sp1_gpu_cudart::DeviceTensor::from_host(
+                    &MleEval::from(round_host).into_evaluations(),
+                    &scope,
+                )
+                .unwrap();
+                new_evaluation_claims.push(MleEval::new(device_tensor.into_inner()));
             }
 
             let mut prover_challenger = challenger.clone();

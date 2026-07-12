@@ -3,6 +3,9 @@
 //! This module provides a builder for the [`NetworkProver`].
 
 use alloy_primitives::Address;
+use sp1_core_machine::riscv::RiscvAir;
+use sp1_hypercube::Machine;
+use sp1_primitives::SP1Field;
 
 use crate::{
     network::{signer::NetworkSigner, NetworkMode, TEE_NETWORK_RPC_URL},
@@ -12,25 +15,40 @@ use crate::{
 /// A builder for the [`NetworkProver`].
 ///
 /// The builder is used to configure the [`NetworkProver`] before it is built.
-#[derive(Default)]
 pub struct NetworkProverBuilder {
     pub(crate) private_key: Option<String>,
     pub(crate) rpc_url: Option<String>,
     pub(crate) tee_signers: Option<Vec<Address>>,
     pub(crate) signer: Option<NetworkSigner>,
     pub(crate) network_mode: Option<NetworkMode>,
+    pub(crate) hosted: bool,
+    pub(crate) machine: Machine<SP1Field, RiscvAir<SP1Field>>,
+}
+
+impl Default for NetworkProverBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NetworkProverBuilder {
     /// Creates a new [`NetworkProverBuilder`].
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::new_with_machine(RiscvAir::machine())
+    }
+
+    /// Creates a new [`NetworkProverBuilder`] with a given machine.
+    #[must_use]
+    pub const fn new_with_machine(machine: Machine<SP1Field, RiscvAir<SP1Field>>) -> Self {
         Self {
             private_key: None,
             rpc_url: None,
             tee_signers: None,
             signer: None,
             network_mode: None,
+            hosted: false,
+            machine,
         }
     }
 
@@ -85,6 +103,27 @@ impl NetworkProverBuilder {
     #[must_use]
     pub fn private(mut self) -> Self {
         self.rpc_url = Some(TEE_NETWORK_RPC_URL.to_string());
+        self
+    }
+
+    /// Configures the prover for hosted proving.
+    ///
+    /// # Details
+    /// Hosted proving runs in [`NetworkMode::Reserved`] and makes `prove(&pk, stdin).await` skip
+    /// local simulation and use the maximum cycle and gas limits by default, with no
+    /// network-specific toggles required. This matches the behavior expected by self-hosted
+    /// clusters talking to the network-gateway. The defaults remain overridable per request.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use sp1_sdk::ProverClient;
+    ///
+    /// let prover = ProverClient::builder().network().hosted().build();
+    /// ```
+    #[must_use]
+    pub fn hosted(mut self) -> Self {
+        self.hosted = true;
+        self.network_mode = Some(NetworkMode::Reserved);
         self
     }
 
@@ -205,6 +244,29 @@ impl NetworkProverBuilder {
             None => vec![],
         };
 
-        NetworkProver::new(signer, &rpc_url, network_mode).await.with_tee_signers(tee_signers)
+        NetworkProver::new_with_machine(signer, &rpc_url, network_mode, self.machine)
+            .await
+            .with_tee_signers(tee_signers)
+            .with_hosted(self.hosted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_is_not_hosted() {
+        let builder = NetworkProverBuilder::new();
+        assert!(!builder.hosted);
+        assert_eq!(builder.network_mode, None);
+    }
+
+    #[test]
+    fn test_hosted_sets_flag_and_reserved_mode() {
+        let builder = NetworkProverBuilder::new().hosted();
+        assert!(builder.hosted);
+        // Hosted proving always runs in reserved mode.
+        assert_eq!(builder.network_mode, Some(NetworkMode::Reserved));
     }
 }

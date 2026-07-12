@@ -4,10 +4,10 @@ mod hadamard_product;
 mod inner;
 mod mask_counter;
 mod prover_ctx;
-mod sumcheck_integration_tests;
 mod verifier_ctx;
 
-pub use inner::{ZkPcsProver, ZkPcsVerifier, ZkProof};
+pub use inner::{ZkPcsProver, ZkPcsVerifier, ZkProof, ZkProveError};
+pub use prover_ctx::ZkProverCtxInitError;
 pub mod stacked_pcs;
 
 pub use mask_counter::*;

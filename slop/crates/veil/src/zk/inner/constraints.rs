@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Debug,
     ops::{Add, Mul, Neg, Sub},
 };
 
@@ -11,6 +12,7 @@ use super::transcript::{
     MleCommitmentIndex, Point, TranscriptIndex, TranscriptLinConstraint, TranscriptMulConstraint,
 };
 use super::ZkIopCtx;
+use crate::compiler::TranscriptReadError;
 
 /// This trait provides the shared functionality needed by both prover and verifier
 /// contexts for adding and manipulating constraints
@@ -220,7 +222,7 @@ pub trait ConstraintContextInner<K: AbstractField + Copy>: Clone {
 /// - Addition and subtraction (`Add<Self>`, `Sub<Self>`) which return expressions
 pub trait ZkElement<K: AbstractField>:
     Copy
-    + std::fmt::Debug
+    + Debug
     + Into<TranscriptIndex<K>>
     + Into<TranscriptLinConstraint<K>>
     + Add<Self, Output = Self::LinExpr>
@@ -234,7 +236,7 @@ pub trait ZkElement<K: AbstractField>:
 /// Trait for linear expressions in a ZK transcript (prover or verifier side).
 pub trait ZkLinExpression<K: AbstractField, E: ZkElement<K, LinExpr = Self>>:
     Clone
-    + std::fmt::Debug
+    + Debug
     + From<E>
     + From<K>
     + Into<TranscriptLinConstraint<K>>
@@ -303,9 +305,7 @@ impl<K: AbstractField + Copy, C: ConstraintContextInner<K>> ExpressionIndex<K, C
     }
 }
 
-impl<K: AbstractField + Copy, C: ConstraintContextInner<K>> std::fmt::Debug
-    for ExpressionIndex<K, C>
-{
+impl<K: AbstractField + Copy, C: ConstraintContextInner<K>> Debug for ExpressionIndex<K, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.index)
     }
@@ -408,7 +408,7 @@ impl<K: AbstractField + Copy, C: ConstraintContextInner<K>> Mul<ExpressionIndex<
 /// Public interface for [`ConstraintContextInner`]
 pub trait ConstraintContextInnerExt<K: AbstractField + Copy>: Clone {
     type Expr: Clone
-        + std::fmt::Debug
+        + Debug
         + AsRef<Self>
         + Add<K, Output = Self::Expr>
         + Add<Self::Expr, Output = Self::Expr>
@@ -543,15 +543,19 @@ impl<K: AbstractField + Copy, C: ConstraintContextInner<K> + private::Sealed>
 /// Trait for reading ProofTranscripts
 pub trait ZkCnstrAndReadingCtxInner<GC: ZkIopCtx>: ConstraintContextInnerExt<GC::EF> {
     /// Read the next single element from the transcript.
-    fn read_one(&mut self) -> Option<Self::Expr> {
-        self.read_next(1)?.pop()
+    fn read_one(&mut self) -> Result<Self::Expr, TranscriptReadError> {
+        // `read_next(1)` on success returns a Vec of length 1, so `pop` is infallible.
+        Ok(self.read_next(1)?.pop().expect("read_next returned an empty vec on success"))
     }
 
     /// Read the next `num` elements from the transcript
-    fn read_next(&mut self, num: usize) -> Option<Vec<Self::Expr>>;
+    fn read_next(&mut self, num: usize) -> Result<Vec<Self::Expr>, TranscriptReadError>;
 
-    /// Returns a mutable reference to the challenger for Fiat-Shamir.
-    fn challenger(&mut self) -> std::cell::RefMut<'_, GC::Challenger>;
+    /// Run a closure with mutable access to the Fiat-Shamir challenger.
+    ///
+    /// Implementations hold an internal lock for the duration of `f`, so `f` must not
+    /// re-enter the same context (e.g. call `read_next`/`challenger`-equivalents on it).
+    fn with_challenger<R>(&mut self, f: impl FnOnce(&mut GC::Challenger) -> R) -> R;
 
     /// Reads the next PCS commitment from the transcript.
     ///

@@ -1,10 +1,12 @@
 // ZK Stacked PCS Prover implementation
 use crate::zk::inner::{
     MerkleProverData, PcsMultiEvalClaim, ProverValue, ZkIopCtx, ZkMerkleizer, ZkPcsCommitmentError,
-    ZkPcsProver, ZkProtocolProof, ZkProverContext,
+    ZkPcsProver, ZkProverContext,
 };
 use derive_where::derive_where;
 use itertools::Itertools;
+use rand::distributions::{Distribution, Standard};
+use rand::{CryptoRng, Rng};
 use serde::{Deserialize, Serialize};
 use slop_algebra::{AbstractExtensionField, AbstractField};
 use slop_alloc::CpuBackend;
@@ -15,7 +17,7 @@ use slop_commit::Message;
 use slop_matrix::dense::RowMajorMatrix;
 use slop_multilinear::{Mle, Point};
 use slop_tensor::Tensor;
-use std::{fmt::Debug, iter::repeat_with, marker::PhantomData};
+use std::{fmt::Debug, iter::repeat_with, marker::PhantomData, sync::Arc};
 use thiserror::Error;
 
 use rayon::prelude::*;
@@ -63,25 +65,25 @@ impl<GC: ZkIopCtx<PcsProof = ZkStackedPcsProof<GC>>, MK: ZkMerkleizer<GC>>
     ZkProverCtx<GC, StackedPcsProverConfig<GC, MK>>
 {
     /// Initializes a prover context with stacked PCS support.
-    pub fn initialize_with_pcs<RNG: rand::CryptoRng + rand::Rng>(
+    pub fn initialize_with_pcs<RNG: CryptoRng + Rng>(
         mask_length: usize,
         pcs_prover: ZkBasefoldProver<GC, MK>,
         rng: &mut RNG,
-    ) -> Self
+    ) -> Result<Self, crate::zk::ZkProverCtxInitError<GC, StackedPcsProverConfig<GC, MK>>>
     where
-        rand::distributions::Standard: rand::distributions::Distribution<GC::EF>,
+        Standard: Distribution<GC::EF>,
     {
         Self::initialize(mask_length, rng, Some(pcs_prover))
     }
 
     /// Initializes a linear-only prover context with stacked PCS support.
-    pub fn initialize_with_pcs_only_lin<RNG: rand::CryptoRng + rand::Rng>(
+    pub fn initialize_with_pcs_only_lin<RNG: CryptoRng + Rng>(
         mask_length: usize,
         pcs_prover: ZkBasefoldProver<GC, MK>,
         rng: &mut RNG,
-    ) -> Self
+    ) -> Result<Self, crate::zk::ZkProverCtxInitError<GC, StackedPcsProverConfig<GC, MK>>>
     where
-        rand::distributions::Standard: rand::distributions::Distribution<GC::EF>,
+        Standard: Distribution<GC::EF>,
     {
         Self::initialize_only_lin_constraints(mask_length, rng, Some(pcs_prover))
     }
@@ -100,6 +102,21 @@ pub struct ZkStackedPcsProverData<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> {
 pub enum ZkStackedPcsProverError<E> {
     #[error("Basefold prover error: {0}")]
     BasefoldError(E),
+    /// `zk_commit_mles` was called with an empty message (nothing to commit).
+    #[error("zk_commit_mles requires exactly one MLE")]
+    MissingMle,
+    /// A batched evaluation proof was requested with no claims.
+    #[error("must have at least one claim")]
+    NoClaims,
+    /// Claims in a batch disagree on their number of variables.
+    #[error("all MLEs must have the same number of variables: expected {expected}, got {actual}")]
+    MismatchedNumVars { expected: usize, actual: usize },
+    /// A claim's data tensor has an unexpected number of columns.
+    #[error("data column count mismatch: expected {expected}, got {actual}")]
+    DataColumnMismatch { expected: usize, actual: usize },
+    /// A claim's mask tensor has an unexpected number of columns.
+    #[error("mask column count mismatch: expected {expected}, got {actual}")]
+    MaskColumnMismatch { expected: usize, actual: usize },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -111,56 +128,75 @@ pub struct ZkStackedPcsProof<GC: ZkIopCtx> {
     pub rlc_eval_claim: GC::EF,
     /// RLC padding vector
     pub rlc_padding_vec: Vec<GC::EF>,
-    /// The number of MLEs stacked together
-    pub log_num_polys: usize,
+    /// The number of MLEs stacked together without the masks
+    pub log_num_data_cols: usize,
 }
 
 impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
-    /// Takes in a batch of MLE's and commits it in a zk-way
-    /// The last "padding" entries of each MLE are the padding
+    /// Takes in a (flat) MLE and commits to it in a zk-way.
+    ///
+    /// The MLE is passed as a [`Message`] so the caller does not need to clone or relinquish
+    /// ownership of its data; the underlying buffer is only read, never consumed. The MLE's
+    /// `2^log_num_polynomials * 2^mle_num_vars` entries are interpreted row-major as a matrix
+    /// with `2^log_num_polynomials` data columns. The commitment is built from two separate
+    /// tensors — the data columns and `EF::D` random mask columns — that are merkleized
+    /// *jointly* rather than interleaved into one buffer. Because Reed–Solomon encoding is
+    /// per-column and [`commit_tensors`](slop_merkle_tree::TensorCsProver::commit_tensors)
+    /// concatenates same-index rows across tensors, this yields the exact same commitment as a
+    /// single `[data | mask]` matrix while avoiding the large interleaved allocation.
+    ///
+    /// The `query_count` rate-padding rows must extend the data polynomial itself, so they are
+    /// appended to the data buffer. When the caller hands over a uniquely-owned MLE whose buffer
+    /// already has capacity for those rows, this commit performs **no reallocation of the data**.
     #[allow(clippy::type_complexity)]
-    pub fn zk_commit_mles<RNG: rand::CryptoRng + rand::Rng>(
+    pub fn zk_commit_mles<RNG: CryptoRng + Rng>(
         &self,
-        mle: Mle<GC::F, CpuBackend>,
+        mle: Message<Mle<GC::F, CpuBackend>>,
+        log_num_polynomials: usize,
         rng: &mut RNG,
     ) -> Result<
         (GC::Digest, ZkStackedPcsProverData<GC, MK>),
         ZkStackedPcsProverError<BaseFoldConfigProverError<GC, MK>>,
     >
     where
-        rand::distributions::Standard: rand::distributions::Distribution<GC::F>,
+        Standard: Distribution<GC::F>,
     {
-        let log_num_polys = mle.num_polynomials().next_power_of_two().trailing_zeros();
-        let mle_num_vars = mle.num_variables() as usize;
-        let num_data_cols = 1usize << log_num_polys;
+        let num_data_cols = 1usize << log_num_polynomials;
         let num_mask_cols = GC::EF::D;
-        let num_cols = num_data_cols + num_mask_cols;
+
+        // The single committed MLE. Read its shape before taking ownership of the buffer.
+        let data_mle = mle.into_iter().next().ok_or(ZkStackedPcsProverError::MissingMle)?;
+        let mle_num_vars = data_mle.num_variables() as usize - log_num_polynomials;
         let num_data_rows = 1usize << mle_num_vars;
 
-        // Get padding amount from FRI config
+        // Get padding amount from FRI config. These extra rows extend every committed
+        // polynomial to raise its effective rate.
         let query_count = self.inner.encoder.config().num_queries;
         let num_rows = num_data_rows + query_count;
 
-        // Pre-generate random masking and padding using the provided RNG
-        let masking_mle: Vec<GC::F> =
-            repeat_with(|| rng.gen()).take(num_data_rows * num_mask_cols).collect();
-        let padding: Vec<GC::F> = repeat_with(|| rng.gen()).take(query_count * num_cols).collect();
+        // Take ownership of the data buffer. When the MLE is uniquely held this is a move (and
+        // appending the padding below reuses any spare capacity); otherwise we fall back to a
+        // copy of the shared data.
+        let mut data_vec = match Arc::try_unwrap(data_mle) {
+            Ok(mle) => mle.into_guts().into_buffer().into_vec(),
+            Err(shared) => shared.guts().as_slice().to_vec(),
+        };
 
-        // Build the interleaved matrix directly: [data_cols | mask_cols] per row,
-        // followed by padding rows.
-        let mle_vec = mle.into_guts().into_buffer().into_vec();
-        let total_len = num_rows * num_cols;
-        let mut all_mle_vec = Vec::with_capacity(total_len);
-        for i in 0..num_data_rows {
-            all_mle_vec.extend_from_slice(&mle_vec[i * num_data_cols..(i + 1) * num_data_cols]);
-            all_mle_vec.extend_from_slice(&masking_mle[i * num_mask_cols..(i + 1) * num_mask_cols]);
-        }
-        all_mle_vec.extend_from_slice(&padding);
+        // Append `query_count` random padding rows to the data polynomial. This reuses the
+        // buffer's spare capacity when present, leaving the door open for a zero-copy commit.
+        data_vec.extend(repeat_with(|| rng.gen()).take(query_count * num_data_cols));
+        let data_mle = Mle::new(RowMajorMatrix::new(data_vec, num_data_cols).into());
 
-        let all_mle: Message<_> =
-            Mle::new(RowMajorMatrix::new(all_mle_vec, num_cols).into()).into();
+        // The mask is a fresh set of `num_mask_cols` random columns spanning every row (data rows
+        // plus padding rows). It lives in its own tensor and is merkleized jointly with the data,
+        // so it is never interleaved into the data buffer.
+        let mask_vec: Vec<GC::F> =
+            repeat_with(|| rng.gen()).take(num_rows * num_mask_cols).collect();
+        let mask_mle = Mle::new(RowMajorMatrix::new(mask_vec, num_mask_cols).into());
 
-        // commit all MLEs
+        // Commit the data and mask tensors jointly (see the doc comment for why this matches a
+        // single interleaved commitment).
+        let all_mle: Message<_> = Message::from(vec![data_mle, mask_mle]);
         let (commit, full_pcs_data) = self
             .commit_padded_multilinears(all_mle.clone())
             .map_err(ZkStackedPcsProverError::BasefoldError)?;
@@ -172,7 +208,7 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
 
     /// Generate an evaluation proof for a single claim on one committed MLE.
     ///
-    /// Thin wrapper around [`zk_generate_eval_proof_for_mles`] for the single-MLE case.
+    /// Thin wrapper around [`Self::zk_generate_eval_proof_for_mles`] for the single-MLE case.
     #[allow(clippy::type_complexity)]
     pub fn zk_generate_eval_proof_for_mle(
         &self,
@@ -197,7 +233,7 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
     /// Generate a batched evaluation proof for multiple committed MLEs at the same point.
     ///
     /// Each entry in `claims` is a `(prover_data, eval_claim)` pair. All MLEs must have the
-    /// same `log_num_polys` and `mle_num_vars`.
+    /// same shape (same `log_num_data_cols` and `mle_num_vars`).
     ///
     /// Returns a tuple of:
     /// - `ZkStackedPcsProof`: The proof data to send to verifier
@@ -216,64 +252,79 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
         ZkStackedPcsProverError<BaseFoldConfigProverError<GC, MK>>,
     > {
         let num_claims = claims.len();
-        assert!(num_claims > 0, "must have at least one claim");
 
-        // Deconstruct all prover datas and validate they share the same shape
+        // Each commitment stores two tensors: `mles[0]` holds the `num_data_cols` data columns
+        // and `mles[1]` holds the `EF::D` mask columns. The data column count is a power of 2
+        // (set at commit time), so its log is recoverable from the first claim. All other claims
+        // must match this shape.
+        let first_claim = claims.first().ok_or(ZkStackedPcsProverError::NoClaims)?;
+        let mle_num_vars = first_claim.0.mle_num_vars;
+        let log_num_data_cols =
+            first_claim.0.mles[0].num_polynomials().next_power_of_two().trailing_zeros() as usize;
+        let num_data_cols = 1usize << log_num_data_cols;
+
         let mut full_pcs_datas = Vec::with_capacity(num_claims);
         let mut all_mles = Vec::with_capacity(num_claims);
         let mut eval_claims = Vec::with_capacity(num_claims);
 
-        let first_mle_num_vars = claims[0].0.mle_num_vars;
-        let first_log_num_polys = {
-            let n = claims[0].0.mles[0].num_polynomials();
-            (n - GC::EF::D).next_power_of_two().trailing_zeros() as usize
-        };
-
         for (prover_data, eval_claim) in claims {
-            let ZkStackedPcsProverData { full_pcs_data, mles, mle_num_vars } = prover_data;
-            assert_eq!(mle_num_vars, first_mle_num_vars, "all MLEs must have same mle_num_vars");
-            let log_num_polys = (mles[0].num_polynomials() - GC::EF::D)
-                .next_power_of_two()
-                .trailing_zeros() as usize;
-            assert_eq!(log_num_polys, first_log_num_polys, "all MLEs must have same log_num_polys");
+            let ZkStackedPcsProverData { full_pcs_data, mles, mle_num_vars: this_num_vars } =
+                prover_data;
+            if this_num_vars != mle_num_vars {
+                return Err(ZkStackedPcsProverError::MismatchedNumVars {
+                    expected: mle_num_vars,
+                    actual: this_num_vars,
+                });
+            }
+            if mles[0].num_polynomials() != num_data_cols {
+                return Err(ZkStackedPcsProverError::DataColumnMismatch {
+                    expected: num_data_cols,
+                    actual: mles[0].num_polynomials(),
+                });
+            }
+            if mles[1].num_polynomials() != GC::EF::D {
+                return Err(ZkStackedPcsProverError::MaskColumnMismatch {
+                    expected: GC::EF::D,
+                    actual: mles[1].num_polynomials(),
+                });
+            }
 
             full_pcs_datas.push(full_pcs_data);
             all_mles.push(mles);
             eval_claims.push(eval_claim);
         }
 
-        let log_num_polys = first_log_num_polys;
-        let mle_num_vars = first_mle_num_vars;
-        let num_original = 1usize << log_num_polys;
-
         // Step 1: For each commitment, evaluate all rows at the inner point and add to transcript.
         // Only commitment 0 includes mask column evaluations in the transcript;
         // the others only send data column evaluations (since only one mask is used).
-        let (eval_point_inner, _) = eval_point.split_at(eval_point.dimension() - log_num_polys);
+        let (eval_point_inner, _) = eval_point.split_at(eval_point.dimension() - log_num_data_cols);
         let mut per_claim_evals_elts = Vec::with_capacity(num_claims);
         let mut per_claim_evals_slice = Vec::with_capacity(num_claims);
         for (j, mles) in all_mles.iter().enumerate() {
-            let evals = mles[0].eval_at(&eval_point_inner);
-            let evals_slice = evals.into_evaluations().into_buffer().into_vec();
-            let num_to_send = if j == 0 { num_original + GC::EF::D } else { num_original };
+            // Data column evaluations, followed (for commitment 0 only) by the mask column
+            // evaluations. Only one mask is used across the batch, so the others omit it.
+            let mut evals_slice =
+                mles[0].eval_at(&eval_point_inner).into_evaluations().into_buffer().into_vec();
+            if j == 0 {
+                let mask_evals =
+                    mles[1].eval_at(&eval_point_inner).into_evaluations().into_buffer().into_vec();
+                evals_slice.extend(mask_evals);
+            }
+            let num_to_send = if j == 0 { num_data_cols + GC::EF::D } else { num_data_cols };
             let evals_elts = zkbuilder.add_values(&evals_slice[..num_to_send]);
             per_claim_evals_elts.push(evals_elts);
             per_claim_evals_slice.push(evals_slice);
         }
 
-        // Step 2: Sample shared RLC point (dimension = log_num_polys)
-        let rlc_point = {
-            let mut challenger = zkbuilder.challenger();
+        // Step 2: Sample shared RLC point (dimension = log_num_data_cols)
+        let rlc_point = zkbuilder.with_challenger(|challenger| {
             let coords: Vec<GC::EF> =
-                (0..log_num_polys).map(|_| challenger.sample_ext_element()).collect();
+                (0..log_num_data_cols).map(|_| challenger.sample_ext_element()).collect();
             Point::new(coords.into())
-        };
+        });
 
         // Step 3: Sample batching challenge α
-        let batching_challenge: GC::EF = {
-            let mut challenger = zkbuilder.challenger();
-            challenger.sample_ext_element()
-        };
+        let batching_challenge: GC::EF = zkbuilder.with_challenger(|c| c.sample_ext_element());
 
         // Step 4: Compute per-commitment data RLC, then combine with powers of α
         //
@@ -294,29 +345,37 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
         let mut combined_mle_vec: Vec<GC::EF> = vec![GC::EF::zero(); total_rows];
 
         for (j, mles) in all_mles.iter().enumerate() {
-            let to_dot_tensor = mles[0].guts();
-            let stride = to_dot_tensor.strides()[0];
+            let data_tensor = mles[0].guts();
+            let data_stride = data_tensor.strides()[0];
             let data_alpha = alpha_powers[j];
-            // Only include the mask from the first commitment
-            let include_mask = j == 0;
 
-            let per_row: Vec<GC::EF> = to_dot_tensor
-                .as_buffer()
-                .par_chunks_exact(stride)
-                .map(|chunk| {
-                    let eq_sum: GC::EF = eq_evals_slice
-                        .iter()
-                        .zip_eq(chunk[..num_original].iter())
-                        .map(|(eq, &b)| *eq * GC::EF::from(b))
-                        .sum();
-                    let mut val = data_alpha * eq_sum;
-                    if include_mask {
-                        val += alpha_powers[num_claims]
-                            * GC::EF::from_base_slice(&chunk[num_original..]);
-                    }
-                    val
-                })
-                .collect();
+            // Per-row data RLC: Σ_i eq(rlc_point, i) * data_col_i[row].
+            let data_rlc = |data_chunk: &[GC::F]| -> GC::EF {
+                let eq_sum: GC::EF = eq_evals_slice
+                    .iter()
+                    .zip_eq(data_chunk.iter())
+                    .map(|(eq, &b)| <GC::EF as core::ops::Mul<GC::F>>::mul(*eq, b))
+                    .sum();
+                data_alpha * eq_sum
+            };
+
+            // Only the mask from the first commitment is folded in (a single random
+            // polynomial suffices for zero-knowledge); its columns live in `mles[1]`.
+            let per_row: Vec<GC::EF> = if j == 0 {
+                let mask_tensor = mles[1].guts();
+                let mask_stride = mask_tensor.strides()[0];
+                let mask_alpha = alpha_powers[num_claims];
+                data_tensor
+                    .as_buffer()
+                    .par_chunks_exact(data_stride)
+                    .zip(mask_tensor.as_buffer().par_chunks_exact(mask_stride))
+                    .map(|(data_chunk, mask_chunk)| {
+                        data_rlc(data_chunk) + mask_alpha * GC::EF::from_base_slice(mask_chunk)
+                    })
+                    .collect()
+            } else {
+                data_tensor.as_buffer().par_chunks_exact(data_stride).map(data_rlc).collect()
+            };
 
             for (dst, src) in combined_mle_vec.iter_mut().zip(per_row.iter()) {
                 *dst += *src;
@@ -341,38 +400,37 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
         for (j, evals_slice) in per_claim_evals_slice.iter().enumerate() {
             let eq_sum: GC::EF = eq_evals_slice
                 .iter()
-                .zip_eq(evals_slice[..num_original].iter())
+                .zip_eq(evals_slice[..num_data_cols].iter())
                 .map(|(eq_val, &eval)| *eq_val * eval)
                 .sum();
             rlc_eval_claim += alpha_powers[j] * eq_sum;
         }
         // Add the single mask contribution from commitment 0
         let mask_sum_0: GC::EF = (0..GC::EF::D)
-            .map(|i| GC::EF::monomial(i) * per_claim_evals_slice[0][num_original + i])
+            .map(|i| GC::EF::monomial(i) * per_claim_evals_slice[0][num_data_cols + i])
             .sum();
         rlc_eval_claim += alpha_powers[num_claims] * mask_sum_0;
 
         // Step 7: Observe combined padding and eval claim
-        {
-            let mut challenger = zkbuilder.challenger();
+        zkbuilder.with_challenger(|challenger| {
             challenger.observe_ext_element_slice(&rlc_padding_vec[..]);
             challenger.observe_ext_element(rlc_eval_claim);
-        }
+        });
 
         // Step 8: Prove basefold evaluation of the combined polynomial
         let rlc_mle_extension = Mle::new(RowMajorMatrix::new(combined_mle_vec, 1).into());
-        let rlc_eval_proof = {
-            let mut challenger = zkbuilder.challenger();
-            self.prove_with_batched_ef_inputs(
-                eval_point_inner,
-                rlc_mle_extension,
-                rlc_codeword,
-                rlc_eval_claim,
-                full_pcs_datas,
-                &mut challenger,
-            )
-            .map_err(ZkStackedPcsProverError::BasefoldError)?
-        };
+        let rlc_eval_proof = zkbuilder
+            .with_challenger(|challenger| {
+                self.prove_with_batched_ef_inputs(
+                    eval_point_inner,
+                    rlc_mle_extension,
+                    rlc_codeword,
+                    rlc_eval_claim,
+                    full_pcs_datas,
+                    challenger,
+                )
+            })
+            .map_err(ZkStackedPcsProverError::BasefoldError)?;
 
         // Build constraint data (shared with verifier)
         let claim_datas: Vec<_> = eval_claims
@@ -386,15 +444,19 @@ impl<GC: ZkIopCtx, MK: ZkMerkleizer<GC>> ZkBasefoldProver<GC, MK> {
             .collect();
 
         let constraint_data = ZkStackedPcsConstraintData {
-            log_num_cols: log_num_polys,
+            log_num_cols: log_num_data_cols,
             rlc_point,
             batching_challenge,
             combined_rlc_eval_claim: rlc_eval_claim,
             claims: claim_datas,
         };
 
-        let proof =
-            ZkStackedPcsProof { rlc_eval_proof, rlc_eval_claim, rlc_padding_vec, log_num_polys };
+        let proof = ZkStackedPcsProof {
+            rlc_eval_proof,
+            rlc_eval_claim,
+            rlc_padding_vec,
+            log_num_data_cols,
+        };
 
         Ok((proof, constraint_data))
     }
@@ -408,22 +470,25 @@ impl<GC: ZkIopCtx<PcsProof = ZkStackedPcsProof<GC>>, MK: ZkMerkleizer<GC>> ZkPcs
     for ZkBasefoldProver<GC, MK>
 {
     type ProverData = ZkStackedPcsProverData<GC, MK>;
+    type ProveError = ZkStackedPcsProverError<BaseFoldConfigProverError<GC, MK>>;
 
-    fn commit_mle<RNG: rand::CryptoRng + rand::Rng>(
+    fn num_encoding_variables(&self) -> u32 {
+        self.num_encoding_variables
+    }
+
+    fn commit_mle<RNG: CryptoRng + Rng>(
         &self,
-        mle: Mle<GC::F, CpuBackend>,
+        mle: Message<Mle<GC::F, CpuBackend>>,
         log_num_polynomials: usize,
         rng: &mut RNG,
     ) -> Result<(GC::Digest, Self::ProverData), ZkPcsCommitmentError>
     where
-        rand::distributions::Standard: rand::distributions::Distribution<GC::F>,
+        Standard: Distribution<GC::F>,
     {
-        // Stack the flat MLE into a multi-row form
-        let stacked_mle = super::utils::stack_mle(mle, log_num_polynomials);
-
-        // Generate the commitment
+        // The flat MLE is interpreted as a `2^log_num_polynomials`-column matrix internally;
+        // no separate stacking/copy step is needed.
         let (digest, prover_data) = self
-            .zk_commit_mles(stacked_mle, rng)
+            .zk_commit_mles(mle, log_num_polynomials, rng)
             .map_err(|e| ZkPcsCommitmentError::CommitmentFailed(e.to_string()))?;
 
         Ok((digest, prover_data))
@@ -433,7 +498,7 @@ impl<GC: ZkIopCtx<PcsProof = ZkStackedPcsProof<GC>>, MK: ZkMerkleizer<GC>> ZkPcs
         &self,
         ctx: &mut ZkProverContext<GC, MK, Self::ProverData>,
         claim: PcsMultiEvalClaim<GC::EF, ProverValue<GC, MK, Self::ProverData>>,
-    ) -> GC::PcsProof {
+    ) -> Result<GC::PcsProof, Self::ProveError> {
         // Collect prover data and eval claims for each commitment
         let claims: Vec<_> = claim
             .commitment_indices
@@ -447,14 +512,13 @@ impl<GC: ZkIopCtx<PcsProof = ZkStackedPcsProof<GC>>, MK: ZkMerkleizer<GC>> ZkPcs
             })
             .collect();
 
-        // Generate the batched proof
-        let (proof, constraint_data) = self
-            .zk_generate_eval_proof_for_mles(claims, &claim.point, ctx)
-            .expect("Failed to generate ZK stacked PCS proof");
+        // Generate the batched proof — propagate the real PCS error rather than panic.
+        let (proof, constraint_data) =
+            self.zk_generate_eval_proof_for_mles(claims, &claim.point, ctx)?;
 
         // Build the constraints from the constraint data
         constraint_data.build_constraints();
 
-        proof
+        Ok(proof)
     }
 }
